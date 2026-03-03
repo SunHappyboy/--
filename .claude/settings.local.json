@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -Command \"\\(Get-Item ''面试知识点详细内容.md''\\).Length / 1KB\")"
+    ]
+  }
+}
