@@ -1,0 +1,6872 @@
+# Qt 面试知识点整理
+
+## 一、Qt 整体架构
+
+### 1.1 Qt 框架分层
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Qt 应用层                              │
+│            (用户代码 + UI界面)                            │
+├─────────────────────────────────────────────────────────┤
+│                  Qt 核心模块                              │
+│  ┌───────────┐ ┌───────────┐ ┌───────────┐             │
+│  │   QtGui   │ │  QtWidgets│ │ QtNetwork │             │
+│  │ (图形/绘图) │ │ (UI控件)  │ │  (网络)   │             │
+│  └───────────┘ └───────────┘ └───────────┘             │
+│  ┌───────────┐ ┌───────────┐ ┌───────────┐             │
+│  │ QtCore    │ │ QtCharts  │ │ QtSql     │             │
+│  │ (核心基础) │ │  (图表)   │ │  (数据库) │             │
+│  └───────────┘ └───────────┘ └───────────┘             │
+├─────────────────────────────────────────────────────────┤
+│                   Qt 平台抽象层                           │
+│           (事件循环、窗口系统、文件系统)                   │
+├─────────────────────────────────────────────────────────┤
+│                  操作系统层                               │
+│        Windows / Linux / macOS / Android / iOS          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 1.2 Qt4 与 Qt5/Qt6 的主要区别
+
+```cpp
+// ========== Qt4 vs Qt5/Qt6 ==========
+
+// 1. connect 写法变化
+// Qt4 风格（需要运行时检查，容易出错）
+connect(sender, SIGNAL(valueChanged(int)), receiver, SLOT(updateValue(int)));
+
+// Qt5 风格（编译时检查，类型安全）
+connect(sender, &Sender::valueChanged, receiver, &Receiver::updateValue);
+
+// 2. 头文件变化
+// Qt4
+#include <QtGui>
+#include <QtCore>
+
+// Qt5/Qt6（模块化）
+#include <QWidget>      // QtWidgets
+#include <QPainter>     // QtGui
+#include <QChart>       // QtCharts
+
+// 3. QString 初始化
+// Qt4
+QString str = "Hello";  // 隐式转换
+
+// Qt5/Qt6（推荐显式转换）
+QString str = QStringLiteral("Hello");
+QString str2 = QLatin1String("Hello");
+
+// 4. 高分屏支持
+// Qt5.6+ / Qt6
+QApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+QApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
+
+// 5. foreach 保留关键字变为普通宏
+// Qt4/Qt5
+foreach(QString item, list) { ... }
+
+// Qt6（推荐使用范围for）
+for(const QString& item : list) { ... }
+```
+
+### 1.3 跨平台原理
+
+```cpp
+// Qt 跨平台通过 "Write Once, Deploy Everywhere" 实现
+
+// 1. 条件编译
+#ifdef Q_OS_WIN
+    // Windows 特定代码
+    #include <windows.h>
+#elif defined(Q_OS_LINUX)
+    // Linux 特定代码
+    #include <unistd.h>
+#elif defined(Q_OS_MACOS)
+    // macOS 特定代码
+#endif
+
+// 2. 路径处理（自动适配平台）
+QString path = QDir::homePath();  // 自动使用正确分隔符
+QFileInfo fi(path);
+
+// 3. 线程相关（跨平台API）
+QThread::msleep(100);  // 跨平台睡眠
+
+// 4. 编译配置
+// .pro 文件
+win32 {
+    SOURCES += windows_specific.cpp
+    LIBS += -luser32
+}
+unix:!macx {
+    SOURCES += linux_specific.cpp
+    LIBS += -lpthread
+}
+macx {
+    SOURCES += mac_specific.cpp
+}
+```
+
+---
+
+## 二、Qt 核心机制 ⭐
+
+### 2.1 信号与槽机制
+
+**信号槽是 Qt 实现的观察者模式，用于对象间通信**
+
+```cpp
+// ========== 基本用法 ==========
+
+// 1. 定义信号（signals 部分自动由 moc 实现）
+class DataSource : public QObject {
+    Q_OBJECT
+public:
+    void setData(int value) {
+        m_data = value;
+        emit dataChanged(value);  // 发射信号
+    }
+
+signals:
+    void dataChanged(int newValue);      // 信号声明
+    void progressUpdated(int value);     // 可以声明多个
+    void errorOccurred(const QString& msg);
+
+private:
+    int m_data;
+};
+
+// 2. 定义槽函数（普通成员函数、静态函数、lambda都可以是槽）
+class DataDisplay : public QWidget {
+    Q_OBJECT
+public:
+    DataDisplay(QWidget* parent = nullptr) : QWidget(parent) {
+        label = new QLabel(this);
+    }
+
+public slots:  // slots 关键字（Qt5 可省略）
+    void onDataChanged(int value) {
+        label->setText(QString("Value: %1").arg(value));
+    }
+
+    void onError(const QString& msg) {
+        QMessageBox::warning(this, "Error", msg);
+    }
+
+private:
+    QLabel* label;
+};
+
+// 3. 连接信号与槽
+DataSource* source = new DataSource();
+DataDisplay* display = new DataDisplay();
+
+// Qt5 风格（推荐）- 编译时类型检查
+connect(source, &DataSource::dataChanged,
+        display, &DataDisplay::onDataChanged);
+
+// 使用 Lambda 表达式
+connect(source, &DataSource::progressUpdated, [](int value) {
+    qDebug() << "Progress:" << value;
+});
+
+// 带参数的 Lambda
+connect(source, &DataSource::dataChanged, display, [display](int value) {
+    // display 捕获，避免悬垂引用
+    display->setWindowTitle(QString("Value: %1").arg(value));
+});
+
+// 4. 断开连接
+disconnect(source, &DataSource::dataChanged,
+           display, &DataDisplay::onDataChanged);
+
+// 断开所有连接
+disconnect(source);
+```
+
+**Qt::ConnectionType 五种连接方式**
+
+```cpp
+// ========== 连接方式详解 ==========
+
+class Sender : public QObject {
+    Q_OBJECT
+public:
+    Sender() { threadId = std::this_thread::get_id(); }
+
+    void sendSignal() {
+        qDebug() << "Sender thread:" << threadId;
+        emit testSignal();
+    }
+
+signals:
+    void testSignal();
+
+private:
+    std::thread::id threadId;
+};
+
+class Receiver : public QObject {
+    Q_OBJECT
+public:
+    Receiver() { threadId = std::this_thread::get_id(); }
+
+public slots:
+    void onReceive() {
+        qDebug() << "Receiver thread:" << threadId;
+    }
+
+private:
+    std::thread::id threadId;
+};
+
+// ========== 1. AutoConnection（默认）==========
+// 同线程：DirectConnection
+// 跨线程：QueuedConnection
+connect(sender, &Sender::testSignal,
+        receiver, &Receiver::onReceive,
+        Qt::AutoConnection);
+
+// ========== 2. DirectConnection（直接连接）==========
+// 槽函数在信号发射线程立即执行（同步）
+connect(sender, &Sender::testSignal,
+        receiver, &Receiver::onReceive,
+        Qt::DirectConnection);
+
+// ========== 3. QueuedConnection（队列连接）==========
+// 槽函数在接收者线程的事件循环中执行（异步）
+connect(sender, &Sender::testSignal,
+        receiver, &Receiver::onReceive,
+        Qt::QueuedConnection);
+
+// ========== 4. BlockingQueuedConnection（阻塞队列）==========
+// 信号发射线程会阻塞等待槽函数执行完成
+// 只能用于跨线程，同线程会死锁！
+connect(sender, &Sender::testSignal,
+        receiver, &Receiver::onReceive,
+        Qt::BlockingQueuedConnection);
+
+// ========== 5. UniqueConnection（唯一连接）==========
+// 防止重复连接，可与其他标志位或运算
+connect(sender, &Sender::testSignal,
+        receiver, &Receiver::onReceive,
+        Qt::UniqueConnection);
+```
+
+**信号槽的优势与不足**
+
+| 优势 | 不足 |
+|------|------|
+| 松耦合，对象无需直接引用 | 运行时开销比直接函数调用大 |
+| 类型安全（Qt5+） | 调试相对困难 |
+| 支持跨线程通信 | 信号不能是模板函数 |
+| 一对多连接 | 槽函数返回值难以获取 |
+
+### 2.2 元对象系统
+
+```cpp
+// ========== Q_OBJECT 宏的作用 ==========
+
+class MyClass : public QObject {
+    Q_OBJECT  // 启用元对象系统
+
+    // Q_OBJECT 宏展开后包含：
+    // 1. virtual const QMetaObject* metaObject() const;
+    // 2. virtual void* qt_metacast(const char*);
+    // 3. virtual int qt_metacall(QMetaObject::Call, int, void**);
+
+    Q_PROPERTY(int value READ value WRITE setValue NOTIFY valueChanged)
+    // Q_PROPERTY: 声明属性，可动态访问
+
+    Q_ENUMS(MyEnum)
+    // Q_ENUMS: 注册枚举到元对象系统
+
+public:
+    enum MyEnum {
+        Value1,
+        Value2,
+        Value3
+    };
+    Q_ENUM(MyEnum)  // Qt5 风格
+
+    MyClass(QObject* parent = nullptr) : QObject(parent), m_value(0) {}
+
+    int value() const { return m_value; }
+    void setValue(int val) {
+        if (m_value != val) {
+            m_value = val;
+            emit valueChanged(val);
+        }
+    }
+
+signals:
+    void valueChanged(int newValue);
+
+public slots:
+    void reset() { setValue(0); }
+
+private:
+    int m_value;
+};
+
+// ========== 反射机制使用 ==========
+
+MyClass* obj = new MyClass();
+
+// 1. 获取元对象
+const QMetaObject* metaObj = obj->metaObject();
+
+// 2. 获取类名
+qDebug() << "Class name:" << metaObj->className();
+
+// 3. 获取信号/槽数量
+qDebug() << "Method count:" << metaObj->methodCount();
+qDebug() << "Signal count:" << metaObj->methodCount() - metaObj->methodOffset();
+
+// 4. 遍历所有方法
+for (int i = 0; i < metaObj->methodCount(); ++i) {
+    QMetaMethod method = metaObj->method(i);
+    qDebug() << method.methodType() << method.name() << method.methodSignature();
+}
+
+// 5. 动态调用方法（反射）
+QByteArray methodName = "reset";
+int methodIndex = metaObj->indexOfMethod(methodName);
+if (methodIndex != -1) {
+    QMetaMethod method = metaObj->method(methodIndex);
+    method.invoke(obj, Qt::QueuedConnection);  // 异步调用
+    // method.invoke(obj, Qt::DirectConnection);  // 同步调用
+}
+
+// 6. 读取/写入属性（动态访问）
+int propIndex = metaObj->indexOfProperty("value");
+if (propIndex != -1) {
+    QMetaProperty prop = metaObj->property(propIndex);
+    qDebug() << "Property value:" << prop.read(obj).toInt();
+
+    prop.write(obj, 42);  // 设置属性值
+    qDebug() << "New value:" << obj->value();
+}
+
+// 7. 枚举值转换
+QString enumStr = QMetaEnum::fromType<MyClass::MyEnum>().valueToKey(MyClass::Value2);
+qDebug() << "Enum string:" << enumStr;  // "Value2"
+
+// ========== moc 生成文件示例 ==========
+// moc 会生成 moc_myclass.cpp 文件，包含：
+// - 元对象数据
+// - 信号实现
+// - qt_metacall 实现
+```
+
+### 2.3 事件循环与事件处理
+
+```cpp
+// ========== 事件循环原理 ==========
+
+/*
+ * 事件循环流程:
+ * 1. 系统事件产生（鼠标、键盘、网络等）
+ * 2. 事件进入队列
+ * 3. QCoreApplication::exec() 启动事件循环
+ * 4. 从队列取出事件
+ * 5. 分发到对应对象 (sendEvent/postEvent)
+ * 6. 对象处理事件
+ * 7. 循环继续...
+ */
+
+// ========== 事件处理顺序 ==========
+
+class MyWidget : public QWidget {
+public:
+    // 1. 最底层：event() - 所有事件的入口
+    bool event(QEvent* e) override {
+        switch (e->type()) {
+            case QEvent::KeyPress:
+                // 键盘事件
+                return keyPressEvent(static_cast<QKeyEvent*>(e));
+            case QEvent::MouseButtonPress:
+                // 鼠标按下事件
+                return mousePressEvent(static_cast<QMouseEvent*>(e));
+            case QEvent::Timer:
+                // 定时器事件
+                return timerEvent(static_cast<QTimerEvent*>(e));
+            default:
+                return QWidget::event(e);
+        }
+    }
+
+    // 2. 具体事件处理器
+    void keyPressEvent(QKeyEvent* e) override {
+        if (e->key() == Qt::Key_Escape) {
+            close();  // ESC 关闭窗口
+        } else if (e->modifiers() & Qt::ControlModifier && e->key() == Qt::Key_S) {
+            saveFile();  // Ctrl+S 保存
+        }
+        QWidget::keyPressEvent(e);
+    }
+
+    void mousePressEvent(QMouseEvent* e) override {
+        if (e->button() == Qt::LeftButton) {
+            qDebug() << "Left click at:" << e->pos();
+            // 记录拖拽起始点
+            dragStartPos = e->pos();
+        }
+        QWidget::mousePressEvent(e);
+    }
+
+    void mouseMoveEvent(QMouseEvent* e) override {
+        if (e->buttons() & Qt::LeftButton) {
+            // 拖拽逻辑
+            QPoint delta = e->pos() - dragStartPos;
+            move(x() + delta.x(), y() + delta.y());
+        }
+        QWidget::mouseMoveEvent(e);
+    }
+
+private:
+    QPoint dragStartPos;
+};
+
+// ========== 事件过滤器 ==========
+
+// 事件过滤器可以在一个对象中监控另一个对象的事件
+
+class FilterWidget : public QWidget {
+    Q_OBJECT
+public:
+    FilterWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        lineEdit = new QLineEdit(this);
+
+        // 安装事件过滤器
+        lineEdit->installEventFilter(this);
+    }
+
+    // 重写 eventFilter
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (watched == lineEdit) {
+            if (event->type() == QEvent::KeyPress) {
+                QKeyEvent* keyEvent = static_cast<QKeyEvent*>(event);
+
+                // 拦截某些按键
+                if (keyEvent->key() == Qt::Key_Tab) {
+                    qDebug() << "Tab pressed in QLineEdit";
+                    return true;  // 事件已处理，不再传递
+                }
+
+                // 记录所有按键
+                qDebug() << "Key pressed:" << keyEvent->text();
+            }
+        }
+
+        // 调用父类继续处理
+        return QWidget::eventFilter(watched, event);
+    }
+
+private:
+    QLineEdit* lineEdit;
+};
+
+// ========== 自定义事件 ==========
+
+// 1. 定义事件类型
+const QEvent::Type MyCustomEvent = static_cast<QEvent::Type>(QEvent::User + 100);
+
+// 2. 自定义事件类
+class CustomEvent : public QEvent {
+public:
+    CustomEvent(const QString& message)
+        : QEvent(MyCustomEvent), m_message(message) {}
+
+    QString message() const { return m_message; }
+
+private:
+    QString m_message;
+};
+
+// 3. 发送自定义事件
+class EventSender : public QObject {
+    Q_OBJECT
+public:
+    void sendCustomEvent(QObject* receiver) {
+        // 方式1：postEvent - 异步（事件进入队列）
+        QCoreApplication::postEvent(receiver, new CustomEvent("Hello"));
+
+        // 方式2：sendEvent - 同步（立即处理）
+        // 注意：sendEvent 会自动删除事件
+        CustomEvent e("World");
+        QCoreApplication::sendEvent(receiver, &e);
+    }
+};
+
+// 4. 处理自定义事件
+class EventReceiver : public QObject {
+    Q_OBJECT
+protected:
+    bool event(QEvent* e) override {
+        if (e->type() == MyCustomEvent) {
+            CustomEvent* customEvent = static_cast<CustomEvent*>(e);
+            qDebug() << "Received:" << customEvent->message();
+            return true;  // 事件已处理
+        }
+        return QObject::event(e);
+    }
+};
+
+// ========== 常见事件类型 ==========
+/*
+ * QEvent::MouseButtonPress      - 鼠标按下
+ * QEvent::MouseButtonRelease    - 鼠标释放
+ * QEvent::MouseMove             - 鼠标移动
+ * QEvent::KeyPress              - 键盘按下
+ * QEvent::KeyRelease            - 键盘释放
+ * QEvent::FocusIn               - 获得焦点
+ * QEvent::FocusOut              - 失去焦点
+ * QEvent::Enter                 - 鼠标进入
+ * QEvent::Leave                 - 鼠标离开
+ * QEvent::Paint                 - 绘图事件
+ * QEvent::Resize                - 大小改变
+ * QEvent::Timer                 - 定时器事件
+ * QEvent::Close                 - 关闭事件
+ * QEvent::Show                  - 显示事件
+ * QEvent::Hide                  - 隐藏事件
+ */
+```
+
+---
+
+## 三、内存管理
+
+### 3.1 对象树机制
+
+```cpp
+// ========== Qt 父子对象机制 ==========
+
+/*
+ * Qt 使用对象树进行内存管理：
+ * 1. 每个 QObject 可以有父对象
+ * 2. 父对象销毁时，自动销毁所有子对象
+ * 3. 子对象在父对象的 children() 列表中
+ */
+
+void exampleObjectTree() {
+    // 创建父对象
+    QWidget* window = new QWidget();
+
+    // 创建子对象时指定父对象
+    QPushButton* button1 = new QPushButton("Button 1", window);
+    QPushButton* button2 = new QPushButton(window);
+    button2->setParent(window);  // 或稍后设置父对象
+
+    QLabel* label = new QLabel("Label", window);
+
+    // 布局也会被父对象管理
+    QVBoxLayout* layout = new QVBoxLayout(window);
+    layout->addWidget(button1);
+    layout->addWidget(button2);
+    layout->addWidget(label);
+
+    // 只需要删除顶层对象
+    delete window;  // button1, button2, label, layout 都会自动删除
+
+    // ========== 对象树遍历 ==========
+    qDebug() << "Children count:" << window->children().count();
+
+    foreach (QObject* child, window->children()) {
+        qDebug() << "Child:" << child->metaObject()->className();
+    }
+
+    // 查找子对象
+    QPushButton* btn = window->findChild<QPushButton*>();
+    QList<QPushButton*> buttons = window->findChildren<QPushButton*>();
+}
+
+// ========== 注意事项 ==========
+class BadExample :public QObject {
+public:
+    BadExample() {
+        // 错误：删除了有父对象的子对象
+        QPushButton* btn = new QPushButton(this);
+        delete btn;  // 危险！父对象销毁时会再次删除
+    }
+};
+
+class GoodExample :public QObject {
+public:
+    GoodExample() {
+        // 方案1：不设置父对象，手动管理
+        QPushButton* btn = new QPushButton();
+        // 使用后手动 delete
+
+        // 方案2：设置父对象，由父对象管理
+        QPushButton* btn2 = new QPushButton(this);
+        // 不需要手动删除
+    }
+};
+```
+
+### 3.2 智能指针
+
+```cpp
+// ========== Qt 智能指针 ==========
+
+#include <QPointer>
+#include <QSharedPointer>
+#include <QWeakPointer>
+#include <QScopedPointer>
+
+// 1. QPointer - 监控 QObject 指针，对象被删除时自动置空
+void exampleQPointer() {
+    QPointer<QPushButton> ptr = new QPushButton();
+    ptr->setText("Hello");
+
+    if (ptr) {  // 检查对象是否仍然存在
+        ptr->show();
+    }
+
+    delete ptr;  // 或对象被其他地方删除
+    // ptr 现在自动为 nullptr
+
+    if (ptr) {
+        qDebug() << "Still alive";  // 不会执行
+    }
+}
+
+// 2. QSharedPointer - 引用计数智能指针
+void exampleQSharedPointer() {
+    QSharedPointer<QString> ptr1 = QSharedPointer<QString>::create("Hello");
+    qDebug() << "Ref count:" << ptr1.use_count();  // 1
+
+    {
+        QSharedPointer<QString> ptr2 = ptr1;
+        qDebug() << "Ref count:" << ptr1.use_count();  // 2
+    }
+    // ptr2 离开作用域
+    qDebug() << "Ref count:" << ptr1.use_count();  // 1
+}
+
+// 3. QWeakPointer - 弱引用，不影响引用计数
+void exampleQWeakPointer() {
+    QSharedPointer<QString> strong = QSharedPointer<QString>::create("Data");
+    QWeakPointer<QString> weak = strong;
+
+    if (!weak.isNull()) {
+        QSharedPointer<QString> locked = weak.toStrongRef();
+        if (locked) {
+            qDebug() << *locked;  // 安全访问
+        }
+    }
+
+    strong.clear();  // 释放对象
+    // weak 现在为空
+}
+
+// 4. QScopedPointer - 作用域指针（类似 std::unique_ptr）
+void exampleQScopedPointer() {
+    QScopedPointer<QPushButton> ptr(new QPushButton());
+    ptr->setText("Scoped Button");
+
+    // 作用域结束时自动删除
+    // 不能复制，只能移动
+}
+
+// ========== 标准库智能指针在 Qt 中使用 ==========
+#include <memory>
+
+void exampleStdPointers() {
+    // std::unique_ptr - 独占所有权
+    std::unique_ptr<QWidget> widget = std::make_unique<QWidget>();
+    // std::unique_ptr<QWidget> widget2 = widget;  // 错误：不能复制
+    std::unique_ptr<QWidget> widget2 = std::move(widget);  // OK：移动
+
+    // std::shared_ptr - 共享所有权
+    std::shared_ptr<QPushButton> btn = std::make_shared<QPushButton>();
+    std::shared_ptr<QPushButton> btn2 = btn;  // OK：共享
+
+    // std::weak_ptr - 弱引用
+    std::weak_ptr<QPushButton> weak = btn;
+
+    // 注意：不要混用 new 和智能指针
+    // 错误示例：
+    // std::shared_ptr<QWidget> w(new QWidget(), [](QWidget* p){ p->deleteLater(); });
+    // Qt 对象如果有父对象，不要用智能指针管理
+}
+```
+
+### 3.3 内存泄漏检测
+
+```cpp
+// ========== 内存泄漏检测技巧 ==========
+
+// 1. 使用 Qt 的调试函数
+void debugObjectTree() {
+    QWidget* widget = new QWidget();
+
+    // 输出对象树信息
+    widget->dumpObjectInfo();
+    widget->dumpObjectTree();
+
+    // 检查对象是否仍存活（仅调试模式）
+    #ifdef QT_DEBUG
+        if (!widget->parent()) {
+            qDebug() << "Warning: widget without parent!";
+        }
+    #endif
+}
+
+// 2. 重写 deletableLater 检测
+class TrackedObject : public QObject {
+    Q_OBJECT
+public:
+    TrackedObject(QObject* parent = nullptr) : QObject(parent) {
+        qDebug() << "TrackedObject created";
+    }
+
+    ~TrackedObject() override {
+        qDebug() << "TrackedObject destroyed";
+    }
+};
+
+// 3. 使用 Qt 的对象追踪
+class MemoryLeakDetector {
+public:
+    static void track(QObject* obj) {
+        connect(obj, &QObject::destroyed, [](QObject*) {
+            qDebug() << "Object destroyed safely";
+        });
+        m_objects.append(obj);
+    }
+
+    static void report() {
+        qDebug() << "Tracked objects:" << m_objects.size();
+        for (QObject* obj : m_objects) {
+            if (obj) {
+                qDebug() << " - Still alive:" << obj->metaObject()->className();
+            }
+        }
+    }
+
+private:
+    static QList<QPointer<QObject>> m_objects;
+};
+```
+
+---
+
+## 四、常用控件详解
+
+### 4.1 QListWidget / QListView（列表控件）
+
+```cpp
+// ========== QListWidget（便捷方式，小数据量）==========
+
+QListWidget* listWidget = new QListWidget(this);
+
+// 添加项目
+listWidget->addItem("Item 1");
+listWidget->addItem("Item 2");
+listWidget->addItem("Item 3");
+
+// 使用自定义项目
+QListWidgetItem* item = new QListWidgetItem();
+item->setText("Custom Item");
+item->setIcon(QIcon(":/icons/item.png"));
+item->setToolTip("This is a tooltip");
+listWidget->addItem(item);
+
+// 设置选择模式
+listWidget->setSelectionMode(QAbstractItemView::SingleSelection);      // 单选
+// listWidget->setSelectionMode(QAbstractItemView::MultiSelection);     // 多选
+// listWidget->setSelectionMode(QAbstractItemView::ExtendedSelection);  // 扩展选择
+// listWidget->setSelectionMode(QAbstractItemView::ContiguousSelection);// 连续选择
+
+listWidget->setSelectionBehavior(QAbstractItemView::SelectRows);
+
+// 设置编辑触发器
+listWidget->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed);
+
+// 拖拽支持
+listWidget->setDragEnabled(true);
+listWidget->setAcceptDrops(true);
+listWidget->setDropIndicatorShown(true);
+
+// 信号与槽
+connect(listWidget, &QListWidget::itemClicked, [](QListWidgetItem* item) {
+    qDebug() << "Clicked:" << item->text();
+});
+
+connect(listWidget, &QListWidget::itemDoubleClicked, [](QListWidgetItem* item) {
+    qDebug() << "Double clicked:" << item->text();
+    item->setFlags(item->flags() | Qt::ItemIsEditable);  // 使可编辑
+});
+
+connect(listWidget, &QListWidget::currentRowChanged, [](int currentRow) {
+    qDebug() << "Current row:" << currentRow;
+});
+
+connect(listWidget, &QListWidget::itemChanged, [](QListWidgetItem* item) {
+    qDebug() << "Item changed:" << item->text();
+});
+
+// 遍历所有项目
+for (int i = 0; i < listWidget->count(); ++i) {
+    QListWidgetItem* item = listWidget->item(i);
+    qDebug() << item->text();
+}
+
+// 获取选中项目
+QList<QListWidgetItem*> selected = listWidget->selectedItems();
+for (QListWidgetItem* item : selected) {
+    qDebug() << "Selected:" << item->text();
+}
+
+// 删除选中项目
+qDeleteAll(listWidget->selectedItems());
+
+// 清空列表
+listWidget->clear();
+
+// ========== QListView + Model（MVC模式，大数据量）==========
+
+// 1. 使用 QStringListModel
+QListView* listView = new QListView(this);
+QStringListModel* model = new QStringListModel(this);
+
+QStringList data;
+data << "Apple" << "Banana" << "Cherry" << "Durian";
+model->setStringList(data);
+
+listView->setModel(model);
+
+// 动态添加数据
+int row = model->rowCount();
+model->insertRows(row, 1);
+QModelIndex index = model->index(row);
+model->setData(index, "Elderberry");
+
+// 删除数据
+model->removeRows(0, 1);  // 删除第一行
+
+// 2. 使用 QStandardItemModel
+QListView* listView2 = new QListView(this);
+QStandardItemModel* standardModel = new QStandardItemModel(this);
+
+for (int i = 0; i < 10; ++i) {
+    QStandardItem* item = new QStandardItem(QString("Item %1").arg(i));
+    item->setIcon(QIcon(":/icons/item.png"));
+    item->setEditable(true);
+    standardModel->appendRow(item);
+}
+
+listView2->setModel(standardModel);
+
+// 3. 自定义 Model（推荐用于复杂数据）
+class CustomListModel : public QAbstractListModel {
+    Q_OBJECT
+public:
+    struct Contact {
+        QString name;
+        QString phone;
+        QString email;
+    };
+
+    explicit CustomListModel(QObject* parent = nullptr)
+        : QAbstractListModel(parent) {
+        // 初始化数据
+        m_contacts.append({"张三", "13800138000", "zhangsan@qq.com"});
+        m_contacts.append({"李四", "13900139000", "lisi@qq.com"});
+        m_contacts.append({"王五", "13700137000", "wangwu@qq.com"});
+    }
+
+    enum Roles {
+        NameRole = Qt::UserRole + 1,
+        PhoneRole,
+        EmailRole
+    };
+
+    int rowCount(const QModelIndex& parent = QModelIndex()) const override {
+        Q_UNUSED(parent)
+        return m_contacts.size();
+    }
+
+    QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override {
+        if (!index.isValid() || index.row() >= m_contacts.size())
+            return QVariant();
+
+        const Contact& contact = m_contacts.at(index.row());
+
+        switch (role) {
+            case Qt::DisplayRole:
+                return contact.name;
+            case NameRole:
+                return contact.name;
+            case PhoneRole:
+                return contact.phone;
+            case EmailRole:
+                return contact.email;
+            default:
+                return QVariant();
+        }
+    }
+
+    // 添加数据
+    void addContact(const Contact& contact) {
+        beginInsertRows(QModelIndex(), m_contacts.size(), m_contacts.size());
+        m_contacts.append(contact);
+        endInsertRows();
+    }
+
+    // 删除数据
+    void removeContact(int row) {
+        if (row < 0 || row >= m_contacts.size())
+            return;
+
+        beginRemoveRows(QModelIndex(), row, row);
+        m_contacts.removeAt(row);
+        endRemoveRows();
+    }
+
+private:
+    QList<Contact> m_contacts;
+};
+
+// 使用自定义 Model
+CustomListModel* customModel = new CustomListModel(this);
+QListView* listView3 = new QListView(this);
+listView3->setModel(customModel);
+
+// 自定义委托
+class ContactDelegate : public QStyledItemDelegate {
+    Q_OBJECT
+public:
+    void paint(QPainter* painter, const QStyleOptionViewItem& option,
+               const QModelIndex& index) const override {
+        // 自定义绘制
+        QRect rect = option.rect;
+
+        // 绘制背景
+        if (option.state & QStyle::State_Selected) {
+            painter->fillRect(rect, option.palette.highlight());
+        }
+
+        // 绘制文字
+        QString name = index.data(CustomListModel::NameRole).toString();
+        QString phone = index.data(CustomListModel::PhoneRole).toString();
+
+        painter->setPen(option.palette.text().color());
+        painter->drawText(rect.adjusted(5, 5, -5, -5), Qt::AlignLeft | Qt::AlignTop, name);
+        painter->drawText(rect.adjusted(5, 25, -5, -5), Qt::AlignLeft | Qt::AlignTop, phone);
+    }
+
+    QSize sizeHint(const QStyleOptionViewItem& option,
+                   const QModelIndex& index) const override {
+        Q_UNUSED(option)
+        Q_UNUSED(index)
+        return QSize(200, 50);  // 每项高度 50
+    }
+};
+
+listView3->setItemDelegate(new ContactDelegate(this));
+```
+
+### 4.2 QTreeWidget / QTreeView（树形控件）
+
+```cpp
+// ========== QTreeWidget（便捷方式）==========
+
+QTreeWidget* treeWidget = new QTreeWidget(this);
+treeWidget->setHeaderLabels(QStringList() << "名称" << "类型" << "大小");
+
+// 添加顶层节点
+QTreeWidgetItem* rootItem = new QTreeWidgetItem(treeWidget);
+rootItem->setText(0, "根目录");
+rootItem->setIcon(0, QIcon(":/icons/folder.png"));
+rootItem->setToolTip(0, "这是根目录");
+
+// 设置第一列宽度
+treeWidget->setColumnWidth(0, 200);
+
+// 添加子节点
+QTreeWidgetItem* childItem1 = new QTreeWidgetItem(rootItem);
+childItem1->setText(0, "子项1");
+childItem1->setText(1, "文件");
+childItem1->setText(2, "1.2 MB");
+childItem1->setIcon(0, QIcon(":/icons/file.png"));
+
+QTreeWidgetItem* childItem2 = new QTreeWidgetItem(rootItem);
+childItem2->setText(0, "子项2");
+childItem2->setText(1, "文件夹");
+childItem2->setText(2, "-");
+childItem2->setIcon(0, QIcon(":/icons/folder.png"));
+
+// 批量添加子节点
+for (int i = 0; i < 5; ++i) {
+    QTreeWidgetItem* item = new QTreeWidgetItem(childItem2);
+    item->setText(0, QString("项目 %1").arg(i + 1));
+    item->setText(1, "文件");
+    item->setText(2, QString("%1 KB").arg((i + 1) * 100));
+
+    // 设置复选框
+    item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+    item->setCheckState(0, Qt::Unchecked);
+}
+
+// 展开节点
+rootItem->setExpanded(true);
+childItem2->setExpanded(true);
+
+// 设置编辑属性
+treeWidget->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed);
+
+// 设置选择模式
+treeWidget->setSelectionBehavior(QAbstractItemView::SelectRows);
+treeWidget->setSelectionMode(QAbstractItemView::SingleSelection);
+
+// 信号与槽
+connect(treeWidget, &QTreeWidget::itemClicked, [](QTreeWidgetItem* item, int column) {
+    qDebug() << "Clicked:" << item->text(column) << "Column:" << column;
+});
+
+connect(treeWidget, &QTreeWidget::itemDoubleClicked, [](QTreeWidgetItem* item, int column) {
+    qDebug() << "Double clicked:" << item->text(column);
+});
+
+connect(treeWidget, &QTreeWidget::itemChanged, [](QTreeWidgetItem* item, int column) {
+    qDebug() << "Changed:" << item->text(column);
+});
+
+connect(treeWidget, &QTreeWidget::itemExpanded, [](QTreeWidgetItem* item) {
+    qDebug() << "Expanded:" << item->text(0);
+});
+
+connect(treeWidget, &QTreeWidget::itemCollapsed, [](QTreeWidgetItem* item) {
+    qDebug() << "Collapsed:" << item->text(0);
+});
+
+// 连接复选框状态变化
+connect(treeWidget, &QTreeWidget::itemChanged, [](QTreeWidgetItem* item, int column) {
+    if (column == 0) {
+        qDebug() << "Check state:" << item->checkState(0);
+    }
+});
+
+// 遍历所有节点（递归）
+void traverseTree(QTreeWidgetItem* item, int level = 0) {
+    QString indent(level * 4, ' ');
+    qDebug() << indent << item->text(0);
+
+    for (int i = 0; i < item->childCount(); ++i) {
+        traverseTree(item->child(i), level + 1);
+    }
+}
+
+// 遍历顶层节点
+for (int i = 0; i < treeWidget->topLevelItemCount(); ++i) {
+    traverseTree(treeWidget->topLevelItem(i));
+}
+
+// 获取选中项
+QTreeWidgetItem* current = treeWidget->currentItem();
+if (current) {
+    qDebug() << "Current item:" << current->text(0);
+    qDebug() << "Parent:" << (current->parent() ? current->parent()->text(0) : "None");
+}
+
+// 查找项目
+QList<QTreeWidgetItem*> items = treeWidget->findItems("子项1", Qt::MatchExactly | Qt::MatchRecursive);
+
+// ========== QTreeView + Model（标准MVC模式）==========
+
+// 1. 使用 QStandardItemModel
+QTreeView* treeView = new QTreeView(this);
+QStandardItemModel* standardModel = new QStandardItemModel(this);
+standardModel->setHorizontalHeaderLabels(QStringList() << "名称" << "类型");
+
+// 创建根节点
+QStandardItem* rootItem = standardModel->invisibleRootItem();
+
+// 添加一级节点
+QStandardItem* item1 = new QStandardItem("部门1");
+item1->setIcon(QIcon(":/icons/folder.png"));
+rootItem->appendRow(item1);
+
+// 添加二级节点
+QStandardItem* subItem1 = new QStandardItem("员工1");
+QStandardItem* subItem2 = new QStandardItem("员工2");
+item1->appendRow(subItem1);
+item1->appendRow(subItem2);
+
+treeView->setModel(standardModel);
+treeView->expandAll();
+
+// 2. 使用 QFileSystemModel（文件系统模型）
+QTreeView* fileTreeView = new QTreeView(this);
+QFileSystemModel* fileModel = new QFileSystemModel(this);
+fileModel->setRootPath(QDir::rootPath());
+
+fileTreeView->setModel(fileModel);
+fileTreeView->setRootIndex(fileModel->index(QDir::homePath()));
+fileTreeView->setColumnWidth(0, 250);
+
+// 隐藏某些列
+fileTreeView->setColumnHidden(1, true);  // 隐藏大小列
+fileTreeView->setColumnHidden(2, true);  // 隐藏类型列
+fileTreeView->setColumnHidden(3, true);  // 隐藏修改时间列
+
+// 3. 自定义树形 Model
+class FileSystemModel : public QAbstractItemModel {
+    Q_OBJECT
+public:
+    explicit FileSystemModel(QObject* parent = nullptr) : QAbstractItemModel(parent) {
+        m_rootItem = new TreeItem({ "名称", "大小", "日期" });
+        setupModelData(m_rootItem);
+    }
+
+    ~FileSystemModel() override {
+        delete m_rootItem;
+    }
+
+    QModelIndex index(int row, int column,
+                      const QModelIndex& parent = QModelIndex()) const override {
+        if (!hasIndex(row, column, parent))
+            return QModelIndex();
+
+        TreeItem* parentItem;
+
+        if (!parent.isValid())
+            parentItem = m_rootItem;
+        else
+            parentItem = static_cast<TreeItem*>(parent.internalPointer());
+
+        TreeItem* childItem = parentItem->child(row);
+        if (childItem)
+            return createIndex(row, column, childItem);
+        return QModelIndex();
+    }
+
+    QModelIndex parent(const QModelIndex& index) const override {
+        if (!index.isValid())
+            return QModelIndex();
+
+        TreeItem* childItem = static_cast<TreeItem*>(index.internalPointer());
+        TreeItem* parentItem = childItem->parentItem();
+
+        if (parentItem == m_rootItem)
+            return QModelIndex();
+
+        return createIndex(parentItem->row(), 0, parentItem);
+    }
+
+    int rowCount(const QModelIndex& parent = QModelIndex()) const override {
+        TreeItem* parentItem;
+        if (parent.column() > 0)
+            return 0;
+
+        if (!parent.isValid())
+            parentItem = m_rootItem;
+        else
+            parentItem = static_cast<TreeItem*>(parent.internalPointer());
+
+        return parentItem->childCount();
+    }
+
+    int columnCount(const QModelIndex& parent = QModelIndex()) const override {
+        if (parent.isValid())
+            return static_cast<TreeItem*>(parent.internalPointer())->columnCount();
+        return m_rootItem->columnCount();
+    }
+
+    QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override {
+        if (!index.isValid())
+            return QVariant();
+
+        if (role != Qt::DisplayRole)
+            return QVariant();
+
+        TreeItem* item = static_cast<TreeItem*>(index.internalPointer());
+
+        return item->data(index.column());
+    }
+
+    QVariant headerData(int section, Qt::Orientation orientation,
+                       int role = Qt::DisplayRole) const override {
+        if (orientation == Qt::Horizontal && role == Qt::DisplayRole)
+            return m_rootItem->data(section);
+
+        return QVariant();
+    }
+
+private:
+    class TreeItem {
+    public:
+        explicit TreeItem(const QVector<QVariant>& data, TreeItem* parent = nullptr)
+            : m_itemData(data), m_parentItem(parent) {}
+
+        ~TreeItem() {
+            qDeleteAll(m_childItems);
+        }
+
+        void appendChild(TreeItem* item) {
+            m_childItems.append(item);
+        }
+
+        TreeItem* child(int row) const {
+            return m_childItems.value(row);
+        }
+
+        int childCount() const {
+            return m_childItems.count();
+        }
+
+        int columnCount() const {
+            return m_itemData.count();
+        }
+
+        QVariant data(int column) const {
+            return m_itemData.value(column);
+        }
+
+        int row() const {
+            if (m_parentItem)
+                return m_parentItem->m_childItems.indexOf(const_cast<TreeItem*>(this));
+            return 0;
+        }
+
+        TreeItem* parentItem() const {
+            return m_parentItem;
+        }
+
+    private:
+        QVector<TreeItem*> m_childItems;
+        QVector<QVariant> m_itemData;
+        TreeItem* m_parentItem;
+    };
+
+    TreeItem* m_rootItem;
+
+    void setupModelData(TreeItem* parent) {
+        // 添加示例数据
+        QVector<QVariant> data1;
+        data1 << "文件夹1" << "2 KB" << "2024-01-01";
+        TreeItem* folder1 = new TreeItem(data1, parent);
+        parent->appendChild(folder1);
+
+        QVector<QVariant> data2;
+        data2 << "文件1.txt" << "1 KB" << "2024-01-02";
+        folder1->appendChild(new TreeItem(data2, folder1));
+    }
+};
+```
+
+### 4.3 QTableWidget / QTableView（表格控件）
+
+```cpp
+// ========== QTableWidget（便捷方式）==========
+
+QTableWidget* tableWidget = new QTableWidget(this);
+
+// 设置行列数
+tableWidget->setRowCount(10);
+tableWidget->setColumnCount(5);
+
+// 设置表头
+tableWidget->setHorizontalHeaderLabels(
+    QStringList() << "ID" << "姓名" << "年龄" << "部门" << "薪资"
+);
+
+// 设置表头字体
+QFont headerFont = tableWidget->horizontalHeader()->font();
+headerFont.setBold(true);
+tableWidget->horizontalHeader()->setFont(headerFont);
+
+// 设置单元格内容
+tableWidget->setItem(0, 0, new QTableWidgetItem("001"));
+tableWidget->setItem(0, 1, new QTableWidgetItem("张三"));
+tableWidget->setItem(0, 2, new QTableWidgetItem("28"));
+
+// 设置单元格对齐
+QTableWidgetItem* salaryItem = new QTableWidgetItem("15000");
+salaryItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+tableWidget->setItem(0, 4, salaryItem);
+
+// 使用组合框作为单元格
+QComboBox* combo = new QComboBox();
+combo->addItem("技术部");
+combo->addItem("市场部");
+combo->addItem("人事部");
+tableWidget->setCellWidget(0, 3, combo);
+
+// 使用复选框
+QTableWidgetItem* checkItem = new QTableWidgetItem();
+checkItem->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled);
+checkItem->setCheckState(Qt::Unchecked);
+tableWidget->setItem(1, 0, checkItem);
+
+// 设置表格属性
+tableWidget->setSelectionBehavior(QAbstractItemView::SelectRows);   // 整行选择
+tableWidget->setSelectionMode(QAbstractItemView::SingleSelection);  // 单选
+tableWidget->setEditTriggers(QAbstractItemView::DoubleClicked);     // 双击编辑
+tableWidget->setAlternatingRowColors(true);                         // 交替行颜色
+tableWidget->setSortingEnabled(true);                               // 允许排序
+
+// 表头设置
+tableWidget->horizontalHeader()->setStretchLastSection(true);       // 最后一列拉伸
+tableWidget->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
+tableWidget->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+tableWidget->verticalHeader()->setVisible(false);                    // 隐藏行号
+
+// 合并单元格
+tableWidget->setSpan(0, 0, 2, 1); // 从(0,0)开始，合并2行1列
+
+// 冻结行/列（需要使用 QTableView + SelectionModel）
+tableWidget->setRowHeight(0, 40);  // 设置行高
+tableWidget->setColumnWidth(0, 80);  // 设置列宽
+
+// 信号与槽
+connect(tableWidget, &QTableWidget::cellClicked, [](int row, int column) {
+    qDebug() << "Clicked cell:" << row << column;
+});
+
+connect(tableWidget, &QTableWidget::cellDoubleClicked, [](int row, int column) {
+    qDebug() << "Double clicked:" << row << column;
+});
+
+connect(tableWidget, &QTableWidget::cellChanged, [](int row, int column) {
+    qDebug() << "Cell changed:" << row << column;
+});
+
+connect(tableWidget, &QTableWidget::currentCellChanged, [](int row, int col, int prevRow, int prevCol) {
+    qDebug() << "Current changed:" << row << col << "from:" << prevRow << prevCol;
+});
+
+connect(tableWidget, &QTableWidget::itemSelectionChanged, []() {
+    qDebug() << "Selection changed";
+});
+
+// 获取选中行
+QList<QTableWidgetItem*> selectedItems = tableWidget->selectedItems();
+QSet<int> rows;
+for (QTableWidgetItem* item : selectedItems) {
+    rows.insert(item->row());
+}
+qDebug() << "Selected rows:" << rows.toList();
+
+// 获取指定单元格
+QTableWidgetItem* item = tableWidget->item(0, 1);
+if (item) {
+    qDebug() << "Cell value:" << item->text();
+    qDebug() << "Cell flags:" << item->flags();
+}
+
+// 设置行/列颜色
+for (int row = 0; row < tableWidget->rowCount(); ++row) {
+    for (int col = 0; col < tableWidget->columnCount(); ++col) {
+        QTableWidgetItem* cell = tableWidget->item(row, col);
+        if (!cell) {
+            cell = new QTableWidgetItem();
+            tableWidget->setItem(row, col, cell);
+        }
+
+        // 偶数行设置背景色
+        if (row % 2 == 0) {
+            cell->setBackground(QColor(240, 240, 240));
+        }
+    }
+}
+
+// 右键菜单
+tableWidget->setContextMenuPolicy(Qt::CustomContextMenu);
+connect(tableWidget, &QTableWidget::customContextMenuRequested, [=](const QPoint& pos) {
+    QMenu menu;
+    menu.addAction("添加行");
+    menu.addAction("删除行");
+    menu.addAction("清空");
+    menu.exec(tableWidget->mapToGlobal(pos));
+});
+
+// ========== QTableView + Model（推荐用于大数据量）==========
+
+// 自定义 Table Model
+class TableModel : public QAbstractTableModel {
+    Q_OBJECT
+public:
+    struct RowData {
+        QString id;
+        QString name;
+        QString age;
+        QString department;
+        QString salary;
+    };
+
+    explicit TableModel(QObject* parent = nullptr) : QAbstractTableModel(parent) {
+        // 初始化数据
+        for (int i = 0; i < 100; ++i) {
+            m_data.append({
+                QString::number(i + 1, 'd', 3).rightJustified(3, '0'),
+                QString("用户%1").arg(i + 1),
+                QString::number(20 + (i % 40)),
+                (i % 3 == 0) ? "技术部" : (i % 3 == 1) ? "市场部" : "人事部",
+                QString::number(5000 + (i * 1000))
+            });
+        }
+    }
+
+    int rowCount(const QModelIndex& parent = QModelIndex()) const override {
+        Q_UNUSED(parent)
+        return m_data.size();
+    }
+
+    int columnCount(const QModelIndex& parent = QModelIndex()) const override {
+        Q_UNUSED(parent)
+        return 5;
+    }
+
+    QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override {
+        if (!index.isValid() || index.row() >= m_data.size())
+            return QVariant();
+
+        const RowData& row = m_data[index.row()];
+
+        if (role == Qt::DisplayRole || role == Qt::EditRole) {
+            switch (index.column()) {
+                case 0: return row.id;
+                case 1: return row.name;
+                case 2: return row.age;
+                case 3: return row.department;
+                case 4: return row.salary;
+            }
+        }
+
+        if (role == Qt::TextAlignmentRole) {
+            if (index.column() == 4)  // 薪资列右对齐
+                return Qt::AlignRight | Qt::AlignVCenter;
+        }
+
+        if (role == Qt::BackgroundRole) {
+            if (index.row() % 2 == 0)
+                return QColor(245, 245, 245);
+        }
+
+        return QVariant();
+    }
+
+    QVariant headerData(int section, Qt::Orientation orientation,
+                       int role = Qt::DisplayRole) const override {
+        if (role == Qt::DisplayRole && orientation == Qt::Horizontal) {
+            switch (section) {
+                case 0: return "ID";
+                case 1: return "姓名";
+                case 2: return "年龄";
+                case 3: return "部门";
+                case 4: return "薪资";
+            }
+        }
+
+        if (role == Qt::FontRole && orientation == Qt::Horizontal) {
+            QFont font;
+            font.setBold(true);
+            return font;
+        }
+
+        return QVariant();
+    }
+
+    Qt::ItemFlags flags(const QModelIndex& index) const override {
+        if (!index.isValid())
+            return Qt::NoItemFlags;
+
+        return QAbstractTableModel::flags(index) | Qt::ItemIsEditable;
+    }
+
+    bool setData(const QModelIndex& index, const QVariant& value, int role = Qt::EditRole) override {
+        if (!index.isValid() || role != Qt::EditRole || index.row() >= m_data.size())
+            return false;
+
+        RowData& row = m_data[index.row()];
+
+        switch (index.column()) {
+            case 0: row.id = value.toString(); break;
+            case 1: row.name = value.toString(); break;
+            case 2: row.age = value.toString(); break;
+            case 3: row.department = value.toString(); break;
+            case 4: row.salary = value.toString(); break;
+            default: return false;
+        }
+
+        emit dataChanged(index, index);
+        return true;
+    }
+
+    // 添加行
+    void appendRow(const RowData& data) {
+        beginInsertRows(QModelIndex(), m_data.size(), m_data.size());
+        m_data.append(data);
+        endInsertRows();
+    }
+
+    // 删除行
+    void removeRow(int row) {
+        if (row < 0 || row >= m_data.size())
+            return;
+
+        beginRemoveRows(QModelIndex(), row, row);
+        m_data.removeAt(row);
+        endRemoveRows();
+    }
+
+private:
+    QList<RowData> m_data;
+};
+
+// 使用 TableModel
+QTableView* tableView = new QTableView(this);
+TableModel* model = new TableModel(this);
+
+tableView->setModel(model);
+
+// 视图设置
+tableView->setSelectionBehavior(QAbstractItemView::SelectRows);
+tableView->setSelectionMode(QAbstractItemView::SingleSelection);
+tableView->setAlternatingRowColors(true);
+tableView->setSortingEnabled(true);
+
+// 列宽设置
+tableView->horizontalHeader()->setStretchLastSection(true);
+tableView->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
+tableView->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+tableView->setColumnWidth(0, 80);
+
+// 自定义委托
+class SpinBoxDelegate : public QStyledItemDelegate {
+    Q_OBJECT
+public:
+    QWidget* createEditor(QWidget* parent, const QStyleOptionViewItem& option,
+                         const QModelIndex& index) const override {
+        Q_UNUSED(option)
+        Q_UNUSED(index)
+
+        QSpinBox* editor = new QSpinBox(parent);
+        editor->setFrame(false);
+        editor->setMinimum(0);
+        editor->setMaximum(100);
+        return editor;
+    }
+
+    void setEditorData(QWidget* editor, const QModelIndex& index) const override {
+        int value = index.model()->data(index, Qt::EditRole).toInt();
+        QSpinBox* spinBox = static_cast<QSpinBox*>(editor);
+        spinBox->setValue(value);
+    }
+
+    void setModelData(QWidget* editor, QAbstractItemModel* model,
+                     const QModelIndex& index) const override {
+        QSpinBox* spinBox = static_cast<QSpinBox*>(editor);
+        spinBox->interpretText();
+        int value = spinBox->value();
+        model->setData(index, value, Qt::EditRole);
+    }
+
+    void updateEditorGeometry(QWidget* editor, const QStyleOptionViewItem& option,
+                             const QModelIndex& index) const override {
+        Q_UNUSED(index)
+        editor->setGeometry(option.rect);
+    }
+};
+
+// 为特定列设置委托
+tableView->setItemDelegateForColumn(2, new SpinBoxDelegate(this));  // 年龄列
+```
+
+### 4.4 QChart（图表控件）
+
+**需要添加模块: `QT += charts`**
+
+```cpp
+// ========== 基础设置 ==========
+#include <QtCharts>
+
+QT_CHARTS_USE_NAMESPACE
+
+// 创建图表视图
+QChartView* chartView = new QChartView(this);
+QChart* chart = new QChart();
+chart->setTitle("数据统计分析");
+chart->setAnimationOptions(QChart::SeriesAnimations);
+chartView->setChart(chart);
+
+// ========== 1. 折线图 ==========
+
+QLineSeries* lineSeries = new QLineSeries();
+lineSeries->setName("2024年销售额");
+
+// 添加数据点
+lineSeries->append(0, 15);
+lineSeries->append(1, 28);
+lineSeries->append(2, 35);
+lineSeries->append(3, 42);
+lineSeries->append(4, 58);
+lineSeries->append(5, 65);
+lineSeries->append(6, 72);
+lineSeries->append(7, 88);
+lineSeries->append(8, 95);
+lineSeries->append(9, 105);
+lineSeries->append(10, 115);
+lineSeries->append(11, 128);
+
+// 设置线条样式
+lineSeries->setColor(QColor("#3498db"));
+lineSeries->setPointsVisible(true);  // 显示数据点
+lineSeries->setPointLabelsVisible(true);  // 显示点标签
+lineSeries->setPointLabelsFormat("(@xPoint, @yPoint)");
+lineSeries->setPointLabelsClipping(false);  // 标签不裁剪
+
+// 设置线条宽度
+QPen pen(QColor("#3498db"));
+pen.setWidth(3);
+lineSeries->setPen(pen);
+
+chart->addSeries(lineSeries);
+
+// ========== 2. 柱状图 ==========
+
+QBarSeries* barSeries = new QBarSeries();
+barSeries->setName("年度对比");
+
+QBarSet* set2023 = new QBarSet("2023年");
+QBarSet* set2024 = new QBarSet("2024年");
+
+*set2023 << 120 << 150 << 180 << 210 << 250 << 280
+         << 300 << 320 << 350 << 380 << 400 << 420;
+*set2024 << 150 << 180 << 220 << 280 << 320 << 360
+         << 400 << 450 << 500 << 550 << 600 << 650;
+
+barSeries->append(set2023);
+barSeries->append(set2024);
+
+chart->addSeries(barSeries);
+
+// 设置柱状图颜色
+set2023->setColor(QColor("#95a5a6"));
+set2024->setColor(QColor("#3498db"));
+
+// ========== 3. 饼图 ==========
+
+QPieSeries* pieSeries = new QPieSeries();
+pieSeries->setHoleSize(0.3);  // 设置为环形图
+
+QPieSlice* slice1 = pieSeries->append("技术部", 35);
+QPieSlice* slice2 = pieSeries->append("市场部", 28);
+QPieSlice* slice3 = pieSeries->append("人事部", 15);
+QPieSlice* slice4 = pieSeries->append("财务部", 12);
+QPieSlice* slice5 = pieSeries->append("其他", 10);
+
+// 设置切片样式
+slice1->setColor(QColor("#3498db"));
+slice1->setLabelVisible(true);
+slice1->setLabelColor(Qt::white);
+slice1->setLabel("技术部\n35%");
+
+slice2->setColor(QColor("#2ecc71"));
+slice2->setLabelVisible(true);
+slice2->setLabelColor(Qt::white);
+
+// 突出显示某个切片
+slice1->setExploded(true);
+slice1->setExplodeDistanceFactor(0.1);
+
+chart->addSeries(pieSeries);
+
+// ========== 4. 面积图 ==========
+QAreaSeries* areaSeries = new QAreaSeries();
+QLineSeries* upperSeries = new QLineSeries();
+upperSeries->append(0, 50);
+upperSeries->append(1, 60);
+upperSeries->append(2, 70);
+upperSeries->append(3, 80);
+upperSeries->append(4, 90);
+
+QLineSeries* lowerSeries = new QLineSeries();
+lowerSeries->append(0, 30);
+lowerSeries->append(1, 40);
+lowerSeries->append(2, 45);
+lowerSeries->append(3, 50);
+lowerSeries->append(4, 55);
+
+areaSeries->setUpperSeries(upperSeries);
+areaSeries->setLowerSeries(lowerSeries);
+areaSeries->setColor(QColor("#9b59b6"));
+areaSeries->setBorderColor(QColor("#8e44ad"));
+
+chart->addSeries(areaSeries);
+
+// ========== 5. 散点图 ==========
+QScatterSeries* scatterSeries = new QScatterSeries();
+scatterSeries->setName("数据分布");
+scatterSeries->setMarkerSize(10);
+scatterSeries->setColor(QColor("#e74c3c"));
+
+// 添加随机数据
+for (int i = 0; i < 50; ++i) {
+    scatterSeries->append(i, qrand() % 100);
+}
+
+chart->addSeries(scatterSeries);
+
+// ========== 坐标轴设置 ==========
+
+// 创建数值轴
+QValueAxis* axisX = new QValueAxis();
+axisX->setTitleText("月份");
+axisX->setRange(0, 12);
+axisX->setTickCount(13);
+axisX->setLabelFormat("%d");
+
+QValueAxis* axisY = new QValueAxis();
+axisY->setTitleText("销售额(万元)");
+axisY->setRange(0, 150);
+axisY->setTickCount(10);
+axisY->setLabelFormat("%d");
+
+// 添加到图表
+chart->addAxis(axisX, Qt::AlignBottom);
+chart->addAxis(axisY, Qt::AlignLeft);
+
+// 关联系列与坐标轴
+lineSeries->attachAxis(axisX);
+lineSeries->attachAxis(axisY);
+
+// ========== 类别轴（用于柱状图）==========
+QStringList categories;
+categories << "1月" << "2月" << "3月" << "4月" << "5月" << "6月"
+          << "7月" << "8月" << "9月" << "10月" << "11月" << "12月";
+
+QBarCategoryAxis* axisXCat = new QBarCategoryAxis();
+axisXCat->append(categories);
+chart->addAxis(axisXCat, Qt::AlignBottom);
+barSeries->attachAxis(axisXCat);
+
+// ========== 日期时间轴 ==========
+QDateTimeAxis* axisDateTime = new QDateTimeAxis();
+axisDateTime->setTitleText("时间");
+axisDateTime->setFormat("yyyy-MM-dd");
+axisDateTime->setCount(10);
+
+QDateTime start = QDateTime::currentDateTime();
+QDateTime end = start.addDays(30);
+axisDateTime->setRange(start, end);
+
+chart->addAxis(axisDateTime, Qt::AlignBottom);
+
+// ========== 图例设置 ==========
+chart->legend()->setAlignment(Qt::AlignBottom);
+chart->legend()->setBackgroundVisible(true);
+chart->legend()->setBorderColor(QColor(200, 200, 200));
+chart->legend()->setFont(QFont("Arial", 10));
+
+// 反向图例
+chart->legend()->setReverse(true);
+
+// 隐藏图例
+// chart->legend()->hide();
+
+// ========== 交互功能 ==========
+
+// 设置视图可拖拽
+chartView->setRubberBand(QChartView::RectangleRubberBand);
+
+// 设置缩放
+chartView->setRenderHint(QPainter::Antialiasing);
+
+// 响应点击
+connect(scatterSeries, &QScatterSeries::clicked, [=](const QPointF& point) {
+    qDebug() << "Clicked point:" << point.x() << point.y();
+});
+
+// 响应悬停
+connect(lineSeries, &QLineSeries::hovered, [=](const QPointF& point, bool state) {
+    if (state) {
+        qDebug() << "Hovered:" << point.x() << point.y();
+        chartView->setToolTip(QString("Value: %1").arg(point.y()));
+    }
+});
+```
+
+### 4.5 QGraphicsScene / QGraphicsView（图形视图框架）
+
+```cpp
+// ========== 图形视图框架概述 ==========
+/*
+ * QGraphicsScene  - 场景，管理所有图形项
+ * QGraphicsView  - 视图，显示场景内容
+ * QGraphicsItem  - 图形项，场景中的元素
+ *
+ * 坐标系统：
+ * - 场景坐标：Scene coordinates，逻辑坐标
+ * - 视图坐标：View coordinates，屏幕坐标
+ * - 图形项坐标：Item coordinates，相对坐标
+ */
+
+// ========== 创建场景和视图 ==========
+QGraphicsScene* scene = new QGraphicsScene(this);
+scene->setSceneRect(-200, -150, 400, 300);  // 设置场景范围
+
+QGraphicsView* view = new QGraphicsView(scene, this);
+view->setRenderHint(QPainter::Antialiasing);  // 抗锯齿
+view->setDragMode(QGraphicsView::RubberBandDrag);  // 橡皮筋选择
+view->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
+view->setTransformationAnchor(QGraphicsView::AnchorUnderMouse);
+view->setResizeAnchor(QGraphicsView::AnchorCenter);
+
+// ========== 1. 基本图形项 ==========
+
+// 矩形
+QGraphicsRectItem* rectItem = new QGraphicsRectItem(-50, -50, 100, 100);
+rectItem->setPos(0, 0);
+rectItem->setBrush(QBrush(QColor("#3498db")));
+rectItem->setPen(QPen(Qt::black, 2));
+rectItem->setFlag(QGraphicsItem::ItemIsMovable);       // 可移动
+rectItem->setFlag(QGraphicsItem::ItemIsSelectable);    // 可选择
+rectItem->setFlag(QGraphicsItem::ItemIsFocusable);     // 可聚焦
+rectItem->setFlag(QGraphicsItem::ItemIsHoverable);     // 可悬停
+rectItem->setZValue(1);  // 设置层级
+scene->addItem(rectItem);
+
+// 圆角矩形
+QGraphicsRectItem* roundRect = new QGraphicsRectItem(-30, -30, 60, 60);
+roundRect->setPos(-100, -50);
+roundRect->setBrush(QBrush(QColor("#e74c3c")));
+
+// 设置圆角（需要通过 painter 绘制）
+class RoundedRectItem : public QGraphicsItem {
+public:
+    RoundedRectItem(QGraphicsItem* parent = nullptr) : QGraphicsItem(parent) {
+        setFlag(ItemIsMovable);
+    }
+
+    QRectF boundingRect() const override {
+        return QRectF(-40, -40, 80, 80);
+    }
+
+    void paint(QPainter* painter, const QStyleOptionGraphicsItem*, QWidget*) override {
+        painter->setBrush(QBrush(QColor("#e74c3c")));
+        painter->setPen(QPen(Qt::darkRed, 2));
+        painter->drawRoundedRect(boundingRect(), 10, 10);
+    }
+};
+scene->addItem(new RoundedRectItem());
+
+// 椭圆
+QGraphicsEllipseItem* ellipseItem = new QGraphicsEllipseItem(-40, -40, 80, 80);
+ellipseItem->setPos(100, 0);
+ellipseItem->setBrush(QBrush(QColor("#2ecc71")));
+ellipseItem->setPen(QPen(Qt::darkGreen, 2));
+ellipseItem->setFlag(QGraphicsItem::ItemIsMovable);
+scene->addItem(ellipseItem);
+
+// 文本
+QGraphicsTextItem* textItem = new QGraphicsTextItem("Hello Qt Graphics");
+textItem->setPos(-80, -100);
+textItem->setDefaultTextColor(QColor("#2c3e50"));
+QFont font("Arial", 16, QFont::Bold);
+textItem->setFont(font);
+scene->addItem(textItem);
+
+// 线条
+QGraphicsLineItem* lineItem = new QGraphicsLineItem(-150, 80, 150, 80);
+lineItem->setPen(QPen(Qt::darkBlue, 3, Qt::DashLine));
+scene->addItem(lineItem);
+
+// 多边形
+QGraphicsPolygonItem* polygonItem = new QGraphicsPolygonItem();
+QPolygonF polygon;
+polygon << QPointF(0, -50) << QPointF(50, 50) << QPointF(-50, 50);
+polygonItem->setPolygon(polygon);
+polygonItem->setPos(0, 100);
+polygonItem->setBrush(QBrush(QColor("#f39c12")));
+polygonItem->setPen(QPen(Qt::darkYellow, 2));
+polygonItem->setFlag(QGraphicsItem::ItemIsMovable);
+scene->addItem(polygonItem);
+
+// 路径
+QGraphicsPathItem* pathItem = new QGraphicsPathItem();
+QPainterPath path;
+path.moveTo(0, 0);
+path.cubicTo(50, -50, 100, 50, 150, 0);
+pathItem->setPath(path);
+pathItem->setPos(-150, 0);
+pathItem->setPen(QPen(QColor("#9b59b6"), 3));
+scene->addItem(pathItem);
+
+// 图片
+QGraphicsPixmapItem* pixmapItem = new QGraphicsPixmapItem(QPixmap(":/images/logo.png"));
+pixmapItem->setPos(100, 100);
+pixmapItem->setFlag(QGraphicsItem::ItemIsMovable);
+pixmapItem->setScale(0.5);  // 缩放
+scene->addItem(pixmapItem);
+
+// ========== 2. 自定义图形项 ==========
+
+class CustomItem : public QGraphicsItem {
+public:
+    CustomItem(QGraphicsItem* parent = nullptr) : QGraphicsItem(parent), m_angle(0) {
+        setFlag(QGraphicsItem::ItemIsMovable);
+        setFlag(QGraphicsItem::ItemIsSelectable);
+        setFlag(QGraphicsItem::ItemIsFocusable);
+        setAcceptHoverEvents(true);  // 接受悬停事件
+
+        // 启动动画定时器
+        connect(&m_timer, &QTimer::timeout, this, [this]() {
+            m_angle = (m_angle + 5) % 360;
+            update();
+        });
+        m_timer.start(50);
+    }
+
+    QRectF boundingRect() const override {
+        return QRectF(-50, -50, 100, 100);
+    }
+
+    void paint(QPainter* painter, const QStyleOptionGraphicsItem*, QWidget*) override {
+        // 绘制渐变背景
+        QRadialGradient gradient(0, 0, 50);
+        gradient.setColorAt(0, QColor(60 + m_angle / 10, 140, 200));
+        gradient.setColorAt(1, QColor(40, 100, 160));
+
+        painter->setBrush(QBrush(gradient));
+        painter->setPen(QPen(Qt::darkGray, 2));
+
+        // 绘制旋转的图形
+        painter->save();
+        painter->rotate(m_angle);
+        painter->drawEllipse(-30, -30, 60, 60);
+        painter->drawLine(-30, 0, 30, 0);
+        painter->drawLine(0, -30, 0, 30);
+        painter->restore();
+
+        // 绘制文字
+        painter->setPen(Qt::white);
+        QFont font("Arial", 12, QFont::Bold);
+        painter->setFont(font);
+        painter->drawText(boundingRect(), Qt::AlignCenter, "Custom");
+    }
+
+protected:
+    void hoverEnterEvent(QGraphicsSceneHoverEvent*) override {
+        setScale(1.2);
+        setCursor(Qt::PointingHandCursor);
+        update();
+    }
+
+    void hoverLeaveEvent(QGraphicsSceneHoverEvent*) override {
+        setScale(1.0);
+        setCursor(Qt::ArrowCursor);
+        update();
+    }
+
+    void mousePressEvent(QGraphicsSceneMouseEvent* event) override {
+        if (event->button() == Qt::LeftButton) {
+            m_timer.stop();  // 点击停止动画
+        }
+        QGraphicsItem::mousePressEvent(event);
+    }
+
+private:
+    int m_angle;
+    QTimer m_timer;
+};
+
+scene->addItem(new CustomItem());
+
+// ========== 3. 图形组 ==========
+
+QGraphicsItemGroup* group = scene->createItemGroup(QList<QGraphicsItem*>());
+
+// 向组中添加项目
+QGraphicsRectItem* rect1 = new QGraphicsRectItem(-20, -20, 40, 40);
+rect1->setBrush(Qt::red);
+scene->addItem(rect1);
+
+QGraphicsRectItem* rect2 = new QGraphicsRectItem(20, -20, 40, 40);
+rect2->setBrush(Qt::blue);
+scene->addItem(rect2);
+
+// 添加到组
+group->addToGroup(rect1);
+group->addToGroup(rect2);
+
+// 组整体移动
+group->setPos(-50, -100);
+group->setFlag(QGraphicsItem::ItemIsMovable);
+
+// ========== 4. 坐标变换 ==========
+
+// 旋转
+rectItem->setRotation(45);
+
+// 缩放
+ellipseItem->setScale(1.5);
+
+// 平移（通过 pos）
+textItem->setPos(50, 50);
+
+// 组合变换
+QTransform transform;
+transform.rotate(30);
+transform.scale(1.5, 1.5);
+rectItem->setTransform(transform);
+
+// ========== 5. 碰撞检测 ==========
+
+// 检测与指定项的碰撞
+QList<QGraphicsItem*> collidingItems = rectItem->collidingItems();
+for (QGraphicsItem* item : collidingItems) {
+    qDebug() << "Colliding with:" << item->type();
+}
+
+// 按形状检测碰撞
+collidingItems = rectItem->collidingItems(Qt::IntersectsItemShape);
+
+// 检测两个项是否碰撞
+if (rectItem->collidesWithItem(ellipseItem)) {
+    qDebug() << "Rectangle collides with ellipse";
+}
+
+// 检测点是否在项内
+if (rectItem->contains(QPointF(10, 10))) {
+    qDebug() << "Point (10, 10) is inside rectangle";
+}
+
+// ========== 6. 选择与焦点 ==========
+
+// 设置选择模式
+scene->setSelectionArea(QPainterPath());
+
+// 获取选中项
+QList<QGraphicsItem*> selected = scene->selectedItems();
+for (QGraphicsItem* item : selected) {
+    qDebug() << "Selected item type:" << item->type();
+}
+
+// 设置焦点
+rectItem->setFocus();
+if (rectItem->hasFocus()) {
+    qDebug() << "Rectangle has focus";
+}
+
+// ========== 7. 场景操作 ==========
+
+// 居中显示
+view->centerOn(rectItem);
+
+// 适应视图
+view->fitInView(scene->sceneRect(), Qt::KeepAspectRatio);
+
+// 缩放
+view->scale(1.2, 1.2);  // 放大 20%
+view->rotate(15);       // 旋转视图 15 度
+
+// 设置拖拽模式
+view->setDragMode(QGraphicsView::ScrollHandDrag);     // 手形拖拽
+view->setDragMode(QGraphicsView::RubberBandDrag);     // 橡皮筋选择
+view->setDragMode(QGraphicsView::NoDrag);             // 无拖拽
+
+// ========== 8. 图层与 Z 值 ==========
+/*
+ * Z 值决定绘制顺序：
+ * - Z 值大的项在上层
+ * - Z 值相同时，后添加的项在上层
+ */
+rectItem->setZValue(10);
+ellipseItem->setZValue(5);
+
+// ========== 9. 事件处理 ==========
+connect(scene, &QGraphicsScene::selectionChanged, []() {
+    qDebug() << "Selection changed";
+});
+
+connect(scene, &QGraphicsScene::focusItemChanged, [](QGraphicsItem* newFocus, QGraphicsItem* oldFocus, Qt::FocusReason reason) {
+    qDebug() << "Focus changed from" << oldFocus << "to" << newFocus;
+});
+
+// ========== 10. 场景索引（优化性能）==========
+// 对于大量图形项，使用场景索引提高碰撞检测性能
+scene->setItemIndexMethod(QGraphicsScene::BspTreeIndex);  // BSP树索引
+// scene->setItemIndexMethod(QGraphicsScene::NoIndex);    // 无索引
+```
+
+---
+
+## 五、QSS 样式表
+
+### 5.1 基本语法与加载方式
+
+```cpp
+// ========== 方式1：代码中直接设置 ==========
+widget->setStyleSheet("background-color: #f0f0f0; color: #333;");
+
+// ========== 方式2：从文件加载 ==========
+QFile file(":/styles/style.qss");
+if (file.open(QFile::ReadOnly)) {
+    QString styleSheet = QLatin1String(file.readAll());
+    qApp->setStyleSheet(styleSheet);  // 全局应用
+    file.close();
+}
+
+// ========== 方式3：资源文件 ==========
+// 在 .qrc 文件中定义：
+// <file>styles/style.qss</file>
+```
+
+### 5.2 选择器类型
+
+```css
+/* ========== 1. 类型选择器 ========== */
+QPushButton {
+    background-color: #3498db;
+    color: white;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    font-size: 14px;
+}
+
+/* ========== 2. ID 选择器 ========== */
+QPushButton#okButton {
+    background-color: #27ae60;
+}
+
+QPushButton#cancelButton {
+    background-color: #e74c3c;
+}
+
+/* ========== 3. 属性选择器 ========== */
+QPushButton[class="primary"] {
+    background-color: #2980b9;
+}
+
+QPushButton[class="secondary"] {
+    background-color: #95a5a6;
+}
+
+/* ========== 4. 后代选择器 ========== */
+QDialog QPushButton {
+    min-width: 80px;
+    min-height: 25px;
+}
+
+QGroupBox QPushButton {
+    background-color: #ecf0f1;
+    color: #2c3e50;
+}
+
+/* ========== 5. 子控件选择器 ========== */
+QComboBox::drop-down {
+    border: none;
+    width: 20px;
+}
+
+QComboBox::down-arrow {
+    image: url(:/icons/arrow-down.png);
+    width: 12px;
+    height: 12px;
+}
+
+QComboBox::down-arrow:hover {
+    image: url(:/icons/arrow-down-hover.png);
+}
+
+/* ========== 6. 伪状态 ========== */
+QPushButton:hover {
+    background-color: #2980b9;
+}
+
+QPushButton:pressed {
+    background-color: #1a5276;
+    padding: 9px 15px 7px 17px;  /* 按下效果 */
+}
+
+QPushButton:disabled {
+    background-color: #bdc3c7;
+    color: #7f8c8d;
+}
+
+QLineEdit:focus {
+    border: 2px solid #3498db;
+}
+
+QCheckBox:checked {
+    color: #27ae60;
+}
+
+QCheckBox:unchecked {
+    color: #7f8c8d;
+}
+
+QRadioButton:checked {
+    color: #3498db;
+}
+
+/* 组合伪状态 */
+QPushButton:hover:!pressed {
+    background-color: #5dade2;
+}
+
+QCheckBox:hover:checked {
+    color: #1e8449;
+}
+
+/* ========== 7. 伪元素 ========== */
+QScrollBar:vertical {
+    background: #f0f0f0;
+    width: 12px;
+    border-radius: 6px;
+}
+
+QScrollBar::handle:vertical {
+    background: #bdc3c7;
+    min-height: 30px;
+    border-radius: 6px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #95a5a6;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0px;  /* 隐藏上下箭头 */
+}
+```
+
+### 5.3 常用控件样式示例
+
+```css
+/* ========== Button 样式 ========== */
+QPushButton {
+    background-color: #3498db;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    padding: 10px 20px;
+    font-size: 14px;
+    font-weight: bold;
+    min-width: 80px;
+}
+
+QPushButton:hover {
+    background-color: #2980b9;
+}
+
+QPushButton:pressed {
+    background-color: #21618c;
+    padding: 11px 19px 9px 21px;
+}
+
+QPushButton:disabled {
+    background-color: #bdc3c7;
+    color: #7f8c8d;
+}
+
+/* 扁平按钮 */
+QPushButton[flat="true"] {
+    background-color: transparent;
+    border: 1px solid #3498db;
+    color: #3498db;
+}
+
+QPushButton[flat="true"]:hover {
+    background-color: #3498db;
+    color: white;
+}
+
+/* ========== LineEdit 样式 ========== */
+QLineEdit {
+    background-color: #ffffff;
+    border: 2px solid #bdc3c7;
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 14px;
+    selection-background-color: #3498db;
+}
+
+QLineEdit:focus {
+    border-color: #3498db;
+}
+
+QLineEdit:disabled {
+    background-color: #ecf0f1;
+    color: #95a5a6;
+}
+
+QLineEdit[readOnly="true"] {
+    background-color: #f8f9fa;
+    border-color: #dee2e6;
+}
+
+/* ========== ComboBox 样式 ========== */
+QComboBox {
+    background-color: #ffffff;
+    border: 2px solid #bdc3c7;
+    border-radius: 4px;
+    padding: 6px 10px;
+    min-width: 100px;
+}
+
+QComboBox:hover {
+    border-color: #95a5a6;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 24px;
+}
+
+QComboBox::down-arrow {
+    image: url(:/icons/arrow-down.png);
+}
+
+QComboBox QAbstractItemView {
+    background-color: #ffffff;
+    border: 1px solid #bdc3c7;
+    selection-background-color: #3498db;
+    selection-color: #ffffff;
+}
+
+/* ========== Table 样式 ========== */
+QTableView {
+    background-color: #ffffff;
+    border: 1px solid #bdc3c7;
+    gridline-color: #ecf0f1;
+    selection-background-color: #3498db;
+    selection-color: #ffffff;
+    alternate-background-color: #f8f9fa;
+}
+
+QTableView::item {
+    padding: 6px;
+    border: none;
+}
+
+QTableView::item:selected {
+    background-color: #3498db;
+    color: #ffffff;
+}
+
+QTableView::item:hover {
+    background-color: #ebf5fb;
+    color: #2c3e50;
+}
+
+QHeaderView::section {
+    background-color: #ecf0f1;
+    color: #2c3e50;
+    padding: 8px;
+    border: none;
+    border-right: 1px solid #bdc3c7;
+    border-bottom: 1px solid #bdc3c7;
+    font-weight: bold;
+}
+
+QHeaderView::section:hover {
+    background-color: #d5dbdb;
+}
+
+/* ========== Tab 样式 ========== */
+QTabWidget::pane {
+    border: 1px solid #bdc3c7;
+    background: #ffffff;
+    border-radius: 4px;
+    top: -1px;
+}
+
+QTabBar::tab {
+    background: #ecf0f1;
+    color: #2c3e50;
+    padding: 10px 20px;
+    margin-right: 2px;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+}
+
+QTabBar::tab:selected {
+    background: #ffffff;
+    color: #3498db;
+    border-bottom: 2px solid #3498db;
+}
+
+QTabBar::tab:hover:!selected {
+    background: #d5dbdb;
+}
+
+QTabBar::tab:disabled {
+    color: #bdc3c7;
+}
+
+/* ========== ScrollBar 样式 ========== */
+QScrollBar:vertical {
+    background: #f0f0f0;
+    width: 14px;
+    border-radius: 7px;
+    margin: 0;
+}
+
+QScrollBar::handle:vertical {
+    background: #bdc3c7;
+    min-height: 30px;
+    border-radius: 7px;
+    margin: 2px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #95a5a6;
+}
+
+QScrollBar::handle:vertical:pressed {
+    background: #7f8c8d;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0;
+    background: none;
+}
+
+QScrollBar:horizontal {
+    background: #f0f0f0;
+    height: 14px;
+    border-radius: 7px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #bdc3c7;
+    min-width: 30px;
+    border-radius: 7px;
+    margin: 2px;
+}
+
+/* ========== GroupBox 样式 ========== */
+QGroupBox {
+    background-color: #ffffff;
+    border: 2px solid #3498db;
+    border-radius: 8px;
+    margin-top: 12px;
+    padding: 12px;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 4px 12px;
+    background: #ffffff;
+    color: #3498db;
+}
+
+/* ========== ProgressBar 样式 ========== */
+QProgressBar {
+    border: 2px solid #bdc3c7;
+    border-radius: 8px;
+    text-align: center;
+    height: 25px;
+    background: #ffffff;
+    color: #2c3e50;
+    font-weight: bold;
+}
+
+QProgressBar::chunk {
+    background-color: #3498db;
+    border-radius: 6px;
+}
+
+QProgressBar::chunk:disabled {
+    background-color: #bdc3c7;
+}
+
+/* ========== Slider 样式 ========== */
+QSlider::groove:horizontal {
+    height: 8px;
+    background: #ecf0f1;
+    border-radius: 4px;
+}
+
+QSlider::handle:horizontal {
+    background: #3498db;
+    width: 20px;
+    height: 20px;
+    margin: -6px 0;
+    border-radius: 10px;
+}
+
+QSlider::handle:horizontal:hover {
+    background: #2980b9;
+    width: 24px;
+    height: 24px;
+    margin: -8px 0;
+}
+
+QSlider::sub-page:horizontal {
+    background: #3498db;
+    border-radius: 4px;
+}
+
+/* ========== SpinBox 样式 ========== */
+QSpinBox, QDoubleSpinBox {
+    background-color: #ffffff;
+    border: 2px solid #bdc3c7;
+    border-radius: 4px;
+    padding: 6px;
+    selection-background-color: #3498db;
+}
+
+QSpinBox:focus, QDoubleSpinBox:focus {
+    border-color: #3498db;
+}
+
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    background-color: #ecf0f1;
+    border: none;
+    width: 20px;
+}
+
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+    background-color: #d5dbdb;
+}
+
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    image: url(:/icons/arrow-up-small.png);
+}
+
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: url(:/icons/arrow-down-small.png);
+}
+```
+
+### 5.4 完整主题示例
+
+```css
+/* ========== 深色主题 ========== */
+* {
+    color: #ecf0f1;
+}
+
+QWidget {
+    background-color: #2c3e50;
+}
+
+/* ---------- 窗口和对话框 ---------- */
+QMainWindow, QDialog {
+    background-color: #2c3e50;
+}
+
+/* ---------- 按钮 ---------- */
+QPushButton {
+    background-color: #34495e;
+    border: 1px solid #4a5f7a;
+    border-radius: 6px;
+    padding: 8px 16px;
+    min-width: 80px;
+    font-weight: bold;
+}
+
+QPushButton:hover {
+    background-color: #3d566e;
+    border: 1px solid #5a7495;
+}
+
+QPushButton:pressed {
+    background-color: #2c3e50;
+}
+
+QPushButton:checked {
+    background-color: #3498db;
+    border: 1px solid #5dade2;
+}
+
+QPushButton:disabled {
+    background-color: #2c3e50;
+    color: #7f8c8d;
+}
+
+/* ---------- 输入框 ---------- */
+QLineEdit, QTextEdit, QPlainTextEdit {
+    background-color: #34495e;
+    border: 1px solid #4a5f7a;
+    border-radius: 4px;
+    padding: 6px 10px;
+    selection-background-color: #3498db;
+}
+
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
+    border: 1px solid #3498db;
+}
+
+QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled {
+    background-color: #2c3e50;
+    color: #7f8c8d;
+}
+
+/* ---------- 列表/树/表格 ---------- */
+QListView, QTreeView, QTableView {
+    background-color: #34495e;
+    border: 1px solid #4a5f7a;
+    selection-background-color: #3498db;
+    alternate-background-color: #3d566e;
+}
+
+QListView::item:selected, QTreeView::item:selected, QTableView::item:selected {
+    background-color: #3498db;
+    color: #ffffff;
+}
+
+QListView::item:hover, QTreeView::item:hover, QTableView::item:hover {
+    background-color: #3d566e;
+}
+
+QHeaderView::section {
+    background-color: #2c3e50;
+    color: #ecf0f1;
+    border: none;
+    border-bottom: 1px solid #4a5f7a;
+    border-right: 1px solid #4a5f7a;
+    padding: 8px;
+    font-weight: bold;
+}
+
+QHeaderView::section:hover {
+    background-color: #34495e;
+}
+
+/* ---------- 滚动条 ---------- */
+QScrollBar:vertical, QScrollBar:horizontal {
+    background: #2c3e50;
+    border: none;
+}
+
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background: #5a6e7f;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
+    background: #6a7e8f;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    border: none;
+    background: none;
+}
+
+/* ---------- 菜单 ---------- */
+QMenuBar {
+    background-color: #2c3e50;
+    border-bottom: 1px solid #4a5f7a;
+}
+
+QMenuBar::item {
+    background-color: transparent;
+    padding: 8px 12px;
+}
+
+QMenuBar::item:selected {
+    background-color: #34495e;
+}
+
+QMenu {
+    background-color: #34495e;
+    border: 1px solid #4a5f7a;
+}
+
+QMenu::item {
+    padding: 8px 24px;
+}
+
+QMenu::item:selected {
+    background-color: #3498db;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: #4a5f7a;
+    margin: 4px 8px;
+}
+
+/* ---------- 标签页 ---------- */
+QTabWidget::pane {
+    border: 1px solid #4a5f7a;
+    background: #34495e;
+}
+
+QTabBar::tab {
+    background: #2c3e50;
+    color: #bdc3c7;
+    padding: 10px 20px;
+    margin-right: 2px;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+}
+
+QTabBar::tab:selected {
+    background: #3498db;
+    color: #ffffff;
+}
+
+QTabBar::tab:hover:!selected {
+    background: #34495e;
+    color: #ecf0f1;
+}
+
+/* ---------- 组合框 ---------- */
+QGroupBox {
+    border: 1px solid #4a5f7a;
+    border-radius: 6px;
+    margin-top: 12px;
+    padding: 12px;
+    font-weight: bold;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 4px 12px;
+    background: #2c3e50;
+}
+
+/* ---------- 进度条 ---------- */
+QProgressBar {
+    border: 1px solid #4a5f7a;
+    border-radius: 6px;
+    text-align: center;
+    height: 25px;
+    background: #34495e;
+}
+
+QProgressBar::chunk {
+    background-color: #3498db;
+    border-radius: 4px;
+}
+
+/* ---------- 滑块 ---------- */
+QSlider::groove:horizontal {
+    height: 6px;
+    background: #4a5f7a;
+    border-radius: 3px;
+}
+
+QSlider::handle:horizontal {
+    background: #3498db;
+    width: 18px;
+    height: 18px;
+    margin: -6px 0;
+    border-radius: 9px;
+}
+
+QSlider::handle:horizontal:hover {
+    background: #5dade2;
+    width: 22px;
+    height: 22px;
+    margin: -8px 0;
+}
+
+QSlider::sub-page:horizontal {
+    background: #3498db;
+    border-radius: 3px;
+}
+
+/* ---------- 下拉框 ---------- */
+QComboBox {
+    background-color: #34495e;
+    border: 1px solid #4a5f7a;
+    border-radius: 4px;
+    padding: 6px 10px;
+}
+
+QComboBox:hover {
+    border: 1px solid #5a7495;
+}
+
+QComboBox::drop-down {
+    border: none;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #34495e;
+    border: 1px solid #4a5f7a;
+    selection-background-color: #3498db;
+}
+
+/* ---------- 复选框/单选框 ---------- */
+QCheckBox, QRadioButton {
+    spacing: 8px;
+}
+
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 18px;
+    height: 18px;
+    border: 2px solid #4a5f7a;
+    border-radius: 3px;
+    background: #34495e;
+}
+
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+    background: #3498db;
+    border-color: #3498db;
+}
+
+QCheckBox::indicator:checked {
+    image: url(:/icons/check.png);
+}
+
+QRadioButton::indicator {
+    border-radius: 9px;
+}
+
+QRadioButton::indicator:checked {
+    image: url(:/icons/radio-check.png);
+}
+
+/* ---------- 工具提示 ---------- */
+QToolTip {
+    background-color: #34495e;
+    color: #ecf0f1;
+    border: 1px solid #4a5f7a;
+    padding: 6px;
+    border-radius: 4px;
+}
+
+/* ---------- 状态栏 ---------- */
+QStatusBar {
+    background-color: #2c3e50;
+    border-top: 1px solid #4a5f7a;
+}
+
+QStatusBar::item {
+    border: none;
+}
+
+QStatusBar QLabel {
+    color: #bdc3c7;
+}
+```
+
+---
+
+## 六、多线程
+
+### 6.1 QThread 基本用法
+
+```cpp
+// ========== 方式1：继承 QThread（不推荐）==========
+class WorkerThread : public QThread {
+    Q_OBJECT
+public:
+    explicit WorkerThread(QObject* parent = nullptr) : QThread(parent) {}
+
+    void stop() {
+        requestInterruption();  // 请求中断
+        wait();  // 等待线程结束
+    }
+
+protected:
+    void run() override {
+        // 这里是子线程的代码
+        for (int i = 0; i < 100 && !isInterruptionRequested(); ++i) {
+            emit progressChanged(i);
+
+            // 模拟耗时操作
+            msleep(100);
+        }
+        emit workFinished();
+    }
+
+signals:
+    void progressChanged(int value);
+    void workFinished();
+};
+
+// 使用
+WorkerThread* thread = new WorkerThread();
+connect(thread, &WorkerThread::progressChanged, [](int value) {
+    qDebug() << "Progress:" << value;
+});
+connect(thread, &WorkerThread::workFinished, []() {
+    qDebug() << "Work finished!";
+});
+connect(thread, &WorkerThread::finished, thread, &WorkerThread::deleteLater);
+
+thread->start();
+
+// 停止线程
+// thread->stop();
+```
+
+### 6.2 moveToThread 模式（推荐）
+
+```cpp
+// ========== 方式2：moveToThread（推荐）==========
+
+class Worker : public QObject {
+    Q_OBJECT
+public:
+    explicit Worker(QObject* parent = nullptr) : QObject(parent) {}
+
+public slots:
+    void doWork() {
+        qDebug() << "Worker thread:" << QThread::currentThread();
+
+        // 执行耗时操作
+        QString result;
+        for (int i = 0; i < 100; ++i) {
+            if (QThread::currentThread()->isInterruptionRequested()) {
+                emit workCancelled();
+                return;
+            }
+
+            result.append(QString::number(i) + " ");
+            emit progress(i);
+
+            QThread::msleep(50);  // 模拟耗时
+        }
+
+        emit workFinished(result);
+    }
+
+    void stopWork() {
+        qDebug() << "Stop requested";
+        QThread::currentThread()->requestInterruption();
+    }
+
+signals:
+    void progress(int value);
+    void workFinished(const QString& result);
+    void workCancelled();
+};
+
+// ========== 使用 moveToThread ==========
+
+void exampleMoveToThread() {
+    // 创建线程
+    QThread* thread = new QThread();
+    thread->setObjectName("WorkerThread");
+
+    // 创建 Worker 对象
+    Worker* worker = new Worker();
+
+    // 将 Worker 移动到新线程
+    worker->moveToThread(thread);
+
+    // 连接信号槽
+    // 1. 线程启动时执行工作
+    connect(thread, &QThread::started, worker, &Worker::doWork);
+
+    // 2. 工作完成后停止线程
+    connect(worker, &Worker::workFinished, [thread](const QString& result) {
+        qDebug() << "Result:" << result;
+        thread->quit();  // 退出事件循环
+    });
+
+    connect(worker, &Worker::workCancelled, thread, &QThread::quit);
+
+    // 3. 线程结束后清理
+    connect(thread, &QThread::finished, worker, &Worker::deleteLater);
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+
+    // 4. 进度更新（跨线程自动使用队列连接）
+    connect(worker, &Worker::progress, [](int value) {
+        qDebug() << "Progress:" << value;
+    });
+
+    // 启动线程
+    thread->start();
+    qDebug() << "Main thread:" << QThread::currentThread();
+}
+
+// ========== 注意事项 ==========
+/*
+ * 1. Worker 对象在创建时不能有父对象
+ * 2. Worker 中的槽函数都在子线程中执行
+ * 3. 跨线程信号槽默认使用 QueuedConnection
+ * 4. 不要在子线程中操作 UI（UI 只能在主线程）
+ * 5. 线程结束后必须调用 quit() 退出事件循环
+ */
+```
+
+### 6.3 线程同步机制
+
+```cpp
+// ========== QMutex 互斥锁 ==========
+
+class SharedData {
+public:
+    void addData(const QString& data) {
+        QMutexLocker locker(&m_mutex);  // 自动加锁/解锁
+        m_data.append(data);
+    }
+
+    QStringList getData() {
+        QMutexLocker locker(&m_mutex);
+        return m_data;
+    }
+
+private:
+    QMutex m_mutex;
+    QStringList m_data;
+};
+
+// 手动加锁方式
+void manualLock() {
+    QMutex mutex;
+
+    mutex.lock();
+    // 临界区代码
+    mutex.unlock();
+
+    // 或使用 tryLock
+    if (mutex.tryLock(1000)) {  // 尝试锁定1秒
+        // 成功获取锁
+        mutex.unlock();
+    }
+}
+
+// ========== QReadWriteLock 读写锁 ==========
+
+class DataStore {
+public:
+    void write(const QString& data) {
+        QWriteLocker locker(&m_lock);  // 写锁
+        m_data = data;
+    }
+
+    QString read() const {
+        QReadLocker locker(&m_lock);  // 读锁
+        return m_data;
+    }
+
+private:
+    mutable QReadWriteLock m_lock;
+    QString m_data;
+};
+
+// ========== QSemaphore 信号量 ==========
+
+class ProducerConsumer {
+public:
+    void producer() {
+        forever {
+            // 生产数据
+            m_mutex.lock();
+            m_data.append("item");
+            qDebug() << "Produced, count:" << m_data.size();
+            m_mutex.unlock();
+
+            m_available.release();  // 增加可用资源
+            QThread::msleep(100);
+        }
+    }
+
+    void consumer() {
+        forever {
+            m_available.acquire();  // 等待可用资源
+
+            m_mutex.lock();
+            if (!m_data.isEmpty()) {
+                QString item = m_data.takeFirst();
+                qDebug() << "Consumed:" << item << ", count:" << m_data.size();
+            }
+            m_mutex.unlock();
+        }
+    }
+
+private:
+    QSemaphore m_available = 1;  // 初始有1个资源
+    QMutex m_mutex;
+    QStringList m_data;
+};
+
+// ========== QWaitCondition 条件变量 ==========
+
+class ThreadPool {
+public:
+    void addTask(const QString& task) {
+        QMutexLocker locker(&m_mutex);
+        m_tasks.append(task);
+        m_condition.wakeOne();  // 唤醒一个等待的线程
+    }
+
+    QString waitForTask() {
+        QMutexLocker locker(&m_mutex);
+        while (m_tasks.isEmpty()) {
+            m_condition.wait(&m_mutex);  // 等待条件
+        }
+        return m_tasks.takeFirst();
+    }
+
+private:
+    QMutex m_mutex;
+    QWaitCondition m_condition;
+    QStringList m_tasks;
+};
+
+// ========== QAtomicInt 原子操作 ==========
+
+QAtomicInt counter = 0;
+
+void atomicIncrement() {
+    // 原子递增，无需加锁
+    counter.fetchAndAddRelaxed(1);
+
+    // 或使用
+    int value = counter.load();
+    counter.store(value + 1);
+}
+
+// ========== Qt Concurrent（高级接口）==========
+
+#include <QtConcurrent>
+
+void exampleQtConcurrent() {
+    // 1. 在线程中运行函数
+    QFuture<int> future = QtConcurrent::run([]() {
+        int sum = 0;
+        for (int i = 0; i < 1000; ++i) {
+            sum += i;
+        }
+        return sum;
+    });
+
+    // 等待结果
+    future.waitForFinished();
+    qDebug() << "Sum:" << future.result();
+
+    // 2. 并行处理容器
+    QList<int> numbers;
+    for (int i = 0; i < 100; ++i) {
+        numbers.append(i);
+    }
+
+    QFuture<void> future2 = QtConcurrent::map(numbers, [](int& value) {
+        value = value * value;  // 每个元素平方
+    });
+    future2.waitForFinished();
+
+    // 3. 并行过滤
+    QFuture<int> future3 = QtConcurrent::filtered(numbers, [](int value) {
+        return value > 50;  // 保留大于50的
+    });
+
+    // 4. 使用 QFutureWatcher 监控
+    QFutureWatcher<int>* watcher = new QFutureWatcher<int>();
+    connect(watcher, &QFutureWatcher<int>::finished, [watcher]() {
+        qDebug() << "Done, result:" << watcher->result();
+        watcher->deleteLater();
+    });
+
+    watcher->setFuture(future);
+}
+```
+
+---
+
+## 七、文件与配置
+
+### 7.1 QFile 文件读写
+
+```cpp
+// ========== 文本文件读写 ==========
+
+// 写入文本文件
+void writeTextFile() {
+    QFile file("output.txt");
+    if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QTextStream out(&file);
+        out.setEncoding(QStringConverter::Utf8);  // Qt6
+        // out.setCodec("UTF-8");  // Qt5
+
+        out << "Hello, Qt!" << Qt::endl;
+        out << "中文内容" << Qt::endl;
+        out << 12345 << Qt::endl;
+
+        file.close();
+    }
+}
+
+// 读取文本文件
+void readTextFile() {
+    QFile file("input.txt");
+    if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QTextStream in(&file);
+        in.setEncoding(QStringConverter::Utf8);
+
+        while (!in.atEnd()) {
+            QString line = in.readLine();
+            qDebug() << line;
+        }
+
+        file.close();
+    }
+}
+
+// ========== 二进制文件读写 ==========
+
+void writeBinaryFile() {
+    QFile file("data.bin");
+    if (file.open(QIODevice::WriteOnly)) {
+        QDataStream out(&file);
+
+        // 写入数据
+        out << QString("Hello");
+        out << 42;
+        out << 3.14;
+        out << QByteArray("Binary data");
+
+        file.close();
+    }
+}
+
+void readBinaryFile() {
+    QFile file("data.bin");
+    if (file.open(QIODevice::ReadOnly)) {
+        QDataStream in(&file);
+
+        QString str;
+        int number;
+        double pi;
+        QByteArray data;
+
+        in >> str >> number >> pi >> data;
+
+        qDebug() << str << number << pi << data;
+
+        file.close();
+    }
+}
+
+// ========== QFileInfo 文件信息 ==========
+
+void getFileInfo() {
+    QFileInfo fileInfo("example.txt");
+
+    qDebug() << "Exists:" << fileInfo.exists();
+    qDebug() << "Size:" << fileInfo.size() << "bytes";
+    qDebug() << "Created:" << fileInfo.birthTime();
+    qDebug() << "Modified:" << fileInfo.lastModified();
+    qDebug() << "Readable:" << fileInfo.isReadable();
+    qDebug() << "Writable:" << fileInfo.isWritable();
+    qDebug() << "Absolute path:" << fileInfo.absoluteFilePath();
+    qDebug() << "Suffix:" << fileInfo.suffix();
+    qDebug() << "Base name:" << fileInfo.baseName();
+}
+
+// ========== QDir 目录操作 ==========
+
+void directoryOperations() {
+    // 创建目录
+    QDir dir;
+    if (!dir.exists("myfolder")) {
+        dir.mkpath("myfolder/subfolder");  // 创建多级目录
+    }
+
+    // 遍历目录
+    QDir folder("myfolder");
+    QStringList filters;
+    filters << "*.txt" << "*.md";
+    folder.setNameFilters(filters);
+
+    QFileInfoList fileList = folder.entryInfoList(QDir::Files | QDir::NoDotAndDotDot);
+    for (const QFileInfo& fileInfo : fileList) {
+        qDebug() << fileInfo.fileName() << fileInfo.size();
+    }
+
+    // 删除文件
+    folder.remove("oldfile.txt");
+
+    // 重命名
+    folder.rename("old.txt", "new.txt");
+}
+```
+
+### 7.2 QSettings 配置文件
+
+```cpp
+// ========== QSettings 基本用法 ==========
+
+void settingsExample() {
+    // 创建 Settings 对象（自动选择平台）
+    // Windows: 注册表
+    // macOS: plist 文件
+    // Linux: conf 文件
+    QSettings settings("MyCompany", "MyApp");
+
+    // ========== 写入设置 ==========
+    settings.setValue("window/width", 800);
+    settings.setValue("window/height", 600);
+    settings.setValue("window/x", 100);
+    settings.setValue("window/y", 100);
+    settings.setValue("theme", "dark");
+    settings.setValue("language", "zh_CN");
+
+    // 写入数组
+    QStringList recentFiles;
+    recentFiles << "file1.txt" << "file2.txt" << "file3.txt";
+    settings.setValue("recentFiles", recentFiles);
+
+    // 写入自定义类型
+    QVariantMap customData;
+    customData["key1"] = "value1";
+    customData["key2"] = 42;
+    settings.setValue("custom", customData);
+
+    // ========== 读取设置 ==========
+    int width = settings.value("window/width", 1024).toInt();  // 默认值1024
+    int height = settings.value("window/height", 768).toInt();
+    QString theme = settings.value("theme", "light").toString();
+    QString language = settings.value("language", "en_US").toString();
+
+    qDebug() << "Window size:" << width << "x" << height;
+    qDebug() << "Theme:" << theme;
+    qDebug() << "Language:" << language;
+
+    // 读取数组
+    QStringList files = settings.value("recentFiles").toStringList();
+    qDebug() << "Recent files:" << files;
+
+    // ========== 组设置 ==========
+    settings.beginGroup("network");
+    settings.setValue("host", "192.168.1.1");
+    settings.setValue("port", 8080);
+    settings.setValue("timeout", 30000);
+    settings.endGroup();
+
+    // 读取组设置
+    settings.beginGroup("network");
+    QString host = settings.value("host", "localhost").toString();
+    int port = settings.value("port", 80).toInt();
+    settings.endGroup();
+
+    // ========== 删除设置 ==========
+    settings.remove("theme");  // 删除单个值
+    settings.beginGroup("window");
+    settings.remove("");  // 删除整个组
+    settings.endGroup();
+
+    // ========== 清除所有设置 ==========
+    settings.clear();
+
+    // ========== 使用 INI 文件格式 ==========
+
+    QSettings iniSettings("config.ini", QSettings::IniFormat);
+    iniSettings.setValue("section1/key1", "value1");
+    iniSettings.setValue("section1/key2", "value2");
+    iniSettings.setValue("section2/key1", "value3");
+
+    // INI 文件内容示例：
+    // [section1]
+    // key1=value1
+    // key2=value2
+    //
+    // [section2]
+    // key1=value3
+}
+
+// ========== 窗口状态保存/恢复 ==========
+
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow(QWidget* parent = nullptr) : QMainWindow(parent) {
+        loadSettings();
+    }
+
+    ~MainWindow() {
+        saveSettings();
+    }
+
+private:
+    void saveSettings() {
+        QSettings settings("MyCompany", "MyApp");
+
+        settings.setValue("geometry", saveGeometry());
+        settings.setValue("windowState", saveState());
+        settings.setValue("splitter", m_splitter->saveState());
+    }
+
+    void loadSettings() {
+        QSettings settings("MyCompany", "MyApp");
+
+        restoreGeometry(settings.value("geometry").toByteArray());
+        restoreState(settings.value("windowState").toByteArray());
+        m_splitter->restoreState(settings.value("splitter").toByteArray());
+    }
+
+    QSplitter* m_splitter;
+};
+```
+
+### 7.3 JSON/XML 解析
+
+```cpp
+// ========== JSON 解析（QJsonDocument）==========
+
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+
+void jsonExample() {
+    // ========== 1. 解析 JSON ==========
+    QString jsonString = R"(
+        {
+            "name": "Qt Application",
+            "version": "1.0.0",
+            "settings": {
+                "theme": "dark",
+                "language": "zh_CN"
+            },
+            "users": [
+                {"id": 1, "name": "Alice"},
+                {"id": 2, "name": "Bob"},
+                {"id": 3, "name": "Charlie"}
+            ]
+        }
+    )";
+
+    QJsonParseError error;
+    QJsonDocument doc = QJsonDocument::fromJson(jsonString.toUtf8(), &error);
+
+    if (error.error != QJsonParseError::NoError) {
+        qDebug() << "JSON parse error:" << error.errorString();
+        return;
+    }
+
+    QJsonObject root = doc.object();
+
+    // 读取基本值
+    QString name = root["name"].toString();
+    QString version = root["version"].toString();
+    qDebug() << "Name:" << name << "Version:" << version;
+
+    // 读取嵌套对象
+    QJsonObject settings = root["settings"].toObject();
+    QString theme = settings["theme"].toString();
+    QString language = settings["language"].toString();
+
+    // 读取数组
+    QJsonArray users = root["users"].toArray();
+    for (const QJsonValue& value : users) {
+        QJsonObject user = value.toObject();
+        int id = user["id"].toInt();
+        QString userName = user["name"].toString();
+        qDebug() << "User:" << id << userName;
+    }
+
+    // ========== 2. 生成 JSON ==========
+    QJsonObject newRoot;
+    newRoot["name"] = "MyApp";
+    newRoot["version"] = "2.0.0";
+
+    QJsonObject newSettings;
+    newSettings["theme"] = "light";
+    newSettings["language"] = "en_US";
+    newRoot["settings"] = newSettings;
+
+    QJsonArray newUsers;
+    for (int i = 1; i <= 3; ++i) {
+        QJsonObject user;
+        user["id"] = i;
+        user["name"] = QString("User%1").arg(i);
+        newUsers.append(user);
+    }
+    newRoot["users"] = newUsers;
+
+    QJsonDocument newDoc(newRoot);
+    QString jsonOutput = newDoc.toJson(QJsonDocument::Indented);
+    qDebug() << "Generated JSON:\n" << jsonOutput;
+}
+
+// ========== XML 解析（QDomDocument）==========
+
+#include <QDomDocument>
+
+void xmlExample() {
+    // ========== 解析 XML ==========
+    QString xmlString = R"(
+        <config>
+            <application>
+                <name>MyApp</name>
+                <version>1.0</version>
+            </application>
+            <settings>
+                <setting key="theme" value="dark"/>
+                <setting key="language" value="zh_CN"/>
+            </settings>
+            <users>
+                <user id="1" name="Alice"/>
+                <user id="2" name="Bob"/>
+            </users>
+        </config>
+    )";
+
+    QDomDocument doc;
+    QString errorMsg;
+    int errorLine, errorColumn;
+
+    if (!doc.setContent(xmlString, &errorMsg, &errorLine, &errorColumn)) {
+        qDebug() << "XML parse error:" << errorMsg << "Line:" << errorLine;
+        return;
+    }
+
+    QDomElement root = doc.documentElement();
+
+    // 读取元素
+    QDomNodeList appNodes = root.elementsByTagName("application");
+    if (!appNodes.isEmpty()) {
+        QDomElement app = appNodes.at(0).toElement();
+        QString name = app.firstChildElement("name").text();
+        QString version = app.firstChildElement("version").text();
+        qDebug() << "App:" << name << version;
+    }
+
+    // 读取属性
+    QDomNodeList settingNodes = root.elementsByTagName("setting");
+    for (int i = 0; i < settingNodes.size(); ++i) {
+        QDomElement setting = settingNodes.at(i).toElement();
+        QString key = setting.attribute("key");
+        QString value = setting.attribute("value");
+        qDebug() << "Setting:" << key << "=" << value;
+    }
+
+    // ========== 生成 XML ==========
+    QDomDocument newDoc;
+    QDomElement newRoot = newDoc.createElement("config");
+
+    QDomElement app = newDoc.createElement("application");
+    app.appendChild(newDoc.createElement("name")).appendChild(newDoc.createTextNode("NewApp"));
+    app.appendChild(newDoc.createElement("version")).appendChild(newDoc.createTextNode("2.0"));
+    newRoot.appendChild(app);
+
+    newDoc.appendChild(newRoot);
+
+    QString xmlOutput = newDoc.toString(4);  // 缩进4空格
+    qDebug() << "Generated XML:\n" << xmlOutput;
+}
+```
+
+---
+
+## 八、布局管理
+
+### 8.1 基本布局
+
+```cpp
+// ========== QVBoxLayout 垂直布局 ==========
+
+QWidget* widget = new QWidget();
+QVBoxLayout* vLayout = new QVBoxLayout(widget);
+
+// 添加控件
+vLayout->addWidget(new QPushButton("Button 1"));
+vLayout->addWidget(new QPushButton("Button 2"));
+vLayout->addWidget(new QPushButton("Button 3"));
+
+// 设置间距
+vLayout->setSpacing(10);  // 控件间距
+vLayout->setContentsMargins(20, 20, 20, 20);  // 边距
+
+// 添加弹性空间（会自动扩展）
+vLayout->addStretch();  // 在末尾添加弹簧
+
+// ========== QHBoxLayout 水平布局 ==========
+
+QHBoxLayout* hLayout = new QHBoxLayout();
+hLayout->addWidget(new QLineEdit());
+hLayout->addWidget(new QPushButton("Search"));
+
+// 添加固定间距
+hLayout->addSpacing(20);
+
+hLayout->addWidget(new QPushButton("Cancel"));
+
+// ========== QGridLayout 网格布局 ==========
+
+QGridLayout* gridLayout = new QGridLayout();
+
+// 添加控件到网格（行, 列, 行跨度, 列跨度）
+gridLayout->addWidget(new QLabel("Name:"), 0, 0);
+gridLayout->addWidget(new QLineEdit(), 0, 1);
+
+gridLayout->addWidget(new QLabel("Age:"), 1, 0);
+gridLayout->addWidget(new QSpinBox(), 1, 1);
+
+gridLayout->addWidget(new QLabel("Address:"), 2, 0);
+gridLayout->addWidget(new QTextEdit(), 2, 1, 3, 1);  // 跨3行1列
+
+gridLayout->addWidget(new QLabel("City:"), 2, 2);
+gridLayout->addWidget(new QLineEdit(), 2, 3);
+
+gridLayout->addWidget(new QLabel("Country:"), 3, 2);
+gridLayout->addWidget(new QLineEdit(), 3, 3);
+
+// 设置列宽比例
+gridLayout->setColumnStretch(1, 2);  // 第1列权重为2
+gridLayout->setColumnStretch(3, 1);  // 第3列权重为1
+
+// 设置行高比例
+gridLayout->setRowStretch(4, 1);  // 最后一行可扩展
+
+// ========== QFormLayout 表单布局 ==========
+
+QFormLayout* formLayout = new QFormLayout();
+
+formLayout->addRow("Name:", new QLineEdit());
+formLayout->addRow("Email:", new QLineEdit());
+formLayout->addRow("Password:", new QLineEdit());
+formLayout->addRow("Confirm:", new QLineEdit());
+
+// 添加自定义行
+formLayout->addRow("Agree:", new QCheckBox("I accept the terms"));
+
+// 设置标签对齐方式
+formLayout->setLabelAlignment(Qt::AlignRight);
+
+// 设置表单换行策略
+formLayout->setFormAlignment(Qt::AlignLeft | Qt::AlignTop);
+```
+
+### 8.2 嵌套布局与 Spacer
+
+```cpp
+// ========== 嵌套布局示例 ==========
+
+QWidget* window = new QWidget();
+QVBoxLayout* mainLayout = new QVBoxLayout(window);
+
+// 顶部：水平布局
+QHBoxLayout* topLayout = new QHBoxLayout();
+topLayout->addWidget(new QLabel("Search:"));
+topLayout->addWidget(new QLineEdit());
+topLayout->addWidget(new QPushButton("Go"));
+mainLayout->addLayout(topLayout);
+
+// 中间：网格布局
+QGridLayout* gridLayout = new QGridLayout();
+for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 3; ++col) {
+        gridLayout->addWidget(new QPushButton(QString("Button %1").arg(row * 3 + col)), row, col);
+    }
+}
+mainLayout->addLayout(gridLayout);
+
+// 中间添加弹性空间
+mainLayout->addStretch(1);
+
+// 底部：水平布局
+QHBoxLayout* bottomLayout = new QHBoxLayout();
+bottomLayout->addStretch();  // 左边弹簧
+bottomLayout->addWidget(new QPushButton("OK"));
+bottomLayout->addWidget(new QPushButton("Cancel"));
+mainLayout->addLayout(bottomLayout);
+
+// ========== Spacer（弹簧）==========
+
+QVBoxLayout* layout = new QVBoxLayout();
+
+layout->addWidget(new QLabel("Top"));
+
+// 添加固定高度的弹簧
+layout->addSpacing(50);
+
+layout->addWidget(new QLabel("Middle"));
+
+// 添加可扩展的弹簧（stretch = 1）
+layout->addStretch(1);
+
+layout->addWidget(new QLabel("Bottom"));
+
+// ========== QSplitter（可调整大小的分割器）==========
+
+QSplitter* splitter = new QSplitter(Qt::Horizontal);
+
+// 添加控件
+QTextEdit* leftEdit = new QTextEdit();
+leftEdit->setPlainText("Left Panel");
+splitter->addWidget(leftEdit);
+
+QTextEdit* rightEdit = new QTextEdit();
+rightEdit->setPlainText("Right Panel");
+splitter->addWidget(rightEdit);
+
+// 设置初始比例
+splitter->setStretchFactor(0, 1);  // 左侧权重1
+splitter->setStretchFactor(1, 2);  // 右侧权重2
+
+// 设置最小尺寸
+leftEdit->setMinimumWidth(100);
+rightEdit->setMinimumWidth(100);
+
+// 可折叠
+splitter->setChildrenCollapsible(true);
+
+// 垂直分割器
+QSplitter* vSplitter = new QSplitter(Qt::Vertical);
+vSplitter->addWidget(new QTextEdit());
+vSplitter->addWidget(new QTextEdit());
+```
+
+### 8.3 响应式布局技巧
+
+```cpp
+// ========== 响应式布局 ==========
+
+class ResponsiveWidget : public QWidget {
+public:
+    ResponsiveWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        setupUI();
+    }
+
+private:
+    void setupUI() {
+        QVBoxLayout* mainLayout = new QVBoxLayout(this);
+
+        // 顶部工具栏
+        QHBoxLayout* toolbarLayout = new QHBoxLayout();
+        toolbarLayout->addWidget(new QPushButton("New"));
+        toolbarLayout->addWidget(new QPushButton("Open"));
+        toolbarLayout->addWidget(new QPushButton("Save"));
+        toolbarLayout->addStretch();
+        toolbarLayout->addWidget(new QLabel("Status: Ready"));
+        mainLayout->addLayout(toolbarLayout);
+
+        // 中间内容区
+        QSplitter* splitter = new QSplitter(Qt::Horizontal);
+
+        // 左侧面板
+        QWidget* leftPanel = createLeftPanel();
+        splitter->addWidget(leftPanel);
+
+        // 右侧面板
+        QWidget* rightPanel = createRightPanel();
+        splitter->addWidget(rightPanel);
+
+        mainLayout->addWidget(splitter);
+
+        // 底部状态栏
+        QHBoxLayout* statusLayout = new QHBoxLayout();
+        statusLayout->addWidget(new QLabel("Line: 1, Col: 1"));
+        statusLayout->addStretch();
+        statusLayout->addWidget(new QLabel("UTF-8"));
+        mainLayout->addLayout(statusLayout);
+    }
+
+    QWidget* createLeftPanel() {
+        QWidget* panel = new QWidget();
+        QVBoxLayout* layout = new QVBoxLayout(panel);
+
+        QListWidget* listWidget = new QListWidget();
+        listWidget->addItem("Item 1");
+        listWidget->addItem("Item 2");
+        listWidget->addItem("Item 3");
+        layout->addWidget(listWidget);
+
+        return panel;
+    }
+
+    QWidget* createRightPanel() {
+        QWidget* panel = new QWidget();
+        QVBoxLayout* layout = new QVBoxLayout(panel);
+
+        QTextEdit* textEdit = new QTextEdit();
+        textEdit->setPlaceholderText("Enter text here...");
+        layout->addWidget(textEdit);
+
+        return panel;
+    }
+};
+
+// ========== 动态调整布局 ==========
+
+class DynamicLayoutWidget : public QWidget {
+    Q_OBJECT
+public:
+    DynamicLayoutWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        QVBoxLayout* layout = new QVBoxLayout(this);
+
+        m_stackedWidget = new QStackedWidget();
+        layout->addWidget(m_stackedWidget);
+
+        // 添加不同视图
+        m_stackedWidget->addWidget(createSmallView());
+        m_stackedWidget->addWidget(createLargeView());
+
+        // 默认显示小视图
+        m_stackedWidget->setCurrentIndex(0);
+    }
+
+protected:
+    void resizeEvent(QResizeEvent* event) override {
+        // 根据窗口大小切换视图
+        if (width() < 600) {
+            m_stackedWidget->setCurrentIndex(0);  // 小视图
+        } else {
+            m_stackedWidget->setCurrentIndex(1);  // 大视图
+        }
+        QWidget::resizeEvent(event);
+    }
+
+private:
+    QWidget* createSmallView() {
+        QWidget* view = new QWidget();
+        QVBoxLayout* layout = new QVBoxLayout(view);
+        layout->addWidget(new QPushButton("Vertical Layout 1"));
+        layout->addWidget(new QPushButton("Vertical Layout 2"));
+        layout->addWidget(new QPushButton("Vertical Layout 3"));
+        return view;
+    }
+
+    QWidget* createLargeView() {
+        QWidget* view = new QWidget();
+        QHBoxLayout* layout = new QHBoxLayout(view);
+        layout->addWidget(new QPushButton("Horizontal Layout 1"));
+        layout->addWidget(new QPushButton("Horizontal Layout 2"));
+        layout->addWidget(new QPushButton("Horizontal Layout 3"));
+        return view;
+    }
+
+    QStackedWidget* m_stackedWidget;
+};
+```
+
+---
+
+## 九、对话框与窗口
+
+### 9.1 模态/非模态对话框
+
+```cpp
+// ========== 模态对话框（阻塞）==========
+
+void showModalDialog() {
+    QDialog dialog;
+    dialog.setWindowTitle("Modal Dialog");
+    dialog.resize(300, 200);
+
+    QVBoxLayout* layout = new QVBoxLayout(&dialog);
+    layout->addWidget(new QLabel("This is a modal dialog"));
+
+    QPushButton* okButton = new QPushButton("OK");
+    connect(okButton, &QPushButton::clicked, &dialog, &QDialog::accept);
+    layout->addWidget(okButton);
+
+    // 阻塞直到对话框关闭
+    if (dialog.exec() == QDialog::Accepted) {
+        qDebug() << "User clicked OK";
+    } else {
+        qDebug() << "Dialog was rejected";
+    }
+}
+
+// ========== 非模态对话框（非阻塞）==========
+
+void showModelessDialog() {
+    QDialog* dialog = new QDialog();
+    dialog->setAttribute(Qt::WA_DeleteOnClose);  // 关闭时自动删除
+    dialog->setWindowTitle("Modeless Dialog");
+    dialog->resize(300, 200);
+
+    QVBoxLayout* layout = new QVBoxLayout(dialog);
+    layout->addWidget(new QLabel("This is a modeless dialog"));
+
+    QPushButton* closeButton = new QPushButton("Close");
+    connect(closeButton, &QPushButton::clicked, dialog, &QDialog::accept);
+    connect(dialog, &QDialog::finished, dialog, &QDialog::deleteLater);
+    layout->addWidget(closeButton);
+
+    dialog->show();  // 非阻塞显示
+    qDebug() << "Dialog shown, code continues...";
+}
+
+// ========== 自定义对话框 ==========
+
+class LoginDialog : public QDialog {
+    Q_OBJECT
+public:
+    LoginDialog(QWidget* parent = nullptr) : QDialog(parent) {
+        setWindowTitle("Login");
+        setModal(true);
+
+        QVBoxLayout* layout = new QVBoxLayout(this);
+
+        // 用户名
+        layout->addWidget(new QLabel("Username:"));
+        m_usernameEdit = new QLineEdit();
+        layout->addWidget(m_usernameEdit);
+
+        // 密码
+        layout->addWidget(new QLabel("Password:"));
+        m_passwordEdit = new QLineEdit();
+        m_passwordEdit->setEchoMode(QLineEdit::Password);
+        layout->addWidget(m_passwordEdit);
+
+        // 按钮
+        QHBoxLayout* buttonLayout = new QHBoxLayout();
+        QPushButton* okButton = new QPushButton("Login");
+        QPushButton* cancelButton = new QPushButton("Cancel");
+
+        connect(okButton, &QPushButton::clicked, this, &LoginDialog::tryLogin);
+        connect(cancelButton, &QPushButton::clicked, this, &QDialog::reject);
+
+        buttonLayout->addStretch();
+        buttonLayout->addWidget(okButton);
+        buttonLayout->addWidget(cancelButton);
+        layout->addLayout(buttonLayout);
+    }
+
+    QString username() const { return m_usernameEdit->text(); }
+    QString password() const { return m_passwordEdit->text(); }
+
+private slots:
+    void tryLogin() {
+        if (username().isEmpty() || password().isEmpty()) {
+            QMessageBox::warning(this, "Error", "Please enter username and password");
+            return;
+        }
+        accept();  // 关闭对话框，返回 Accepted
+    }
+
+private:
+    QLineEdit* m_usernameEdit;
+    QLineEdit* m_passwordEdit;
+};
+
+// 使用自定义对话框
+void exampleCustomDialog() {
+    LoginDialog dialog;
+    if (dialog.exec() == QDialog::Accepted) {
+        qDebug() << "Login successful:" << dialog.username();
+    }
+}
+```
+
+### 9.2 QMessageBox 消息框
+
+```cpp
+// ========== 各种消息框 ==========
+
+void messageBoxExamples() {
+    // 1. 信息框
+    QMessageBox::information(nullptr, "Information",
+        "This is an information message.",
+        QMessageBox::Ok);
+
+    // 2. 警告框
+    QMessageBox::warning(nullptr, "Warning",
+        "This is a warning message!",
+        QMessageBox::Ok | QMessageBox::Cancel);
+
+    // 3. 错误框
+    QMessageBox::critical(nullptr, "Error",
+        "An error occurred!",
+        QMessageBox::Abort | QMessageBox::Retry | QMessageBox::Ignore);
+
+    // 4. 询问框
+    QMessageBox::StandardButton reply = QMessageBox::question(nullptr,
+        "Question",
+        "Do you want to continue?",
+        QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel);
+
+    if (reply == QMessageBox::Yes) {
+        qDebug() << "User clicked Yes";
+    } else if (reply == QMessageBox::No) {
+        qDebug() << "User clicked No";
+    } else {
+        qDebug() << "User clicked Cancel";
+    }
+
+    // 5. 关于框
+    QMessageBox::about(nullptr, "About",
+        "<h2>My Application</h2>"
+        "<p>Version 1.0.0</p>"
+        "<p>Copyright © 2024</p>");
+
+    // ========== 详细配置 ==========
+
+    QMessageBox msgBox;
+    msgBox.setWindowTitle("Save Changes");
+    msgBox.setText("The document has been modified.");
+    msgBox.setInformativeText("Do you want to save your changes?");
+    msgBox.setStandardButtons(QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
+    msgBox.setDefaultButton(QMessageBox::Save);
+
+    // 添加自定义按钮
+    QPushButton* saveAllButton = msgBox.addButton("Save All", QMessageBox::ActionRole);
+
+    int ret = msgBox.exec();
+
+    if (msgBox.clickedButton() == saveAllButton) {
+        qDebug() << "Save All clicked";
+    } else if (ret == QMessageBox::Save) {
+        qDebug() << "Save clicked";
+    } else if (ret == QMessageBox::Discard) {
+        qDebug() << "Discard clicked";
+    } else {
+        qDebug() << "Cancel clicked";
+    }
+}
+
+// ========== 自定义消息框 ==========
+
+void customMessageBox() {
+    QMessageBox msgBox;
+    msgBox.setIcon(QMessageBox::Question);
+    msgBox.setWindowTitle("Custom Dialog");
+    msgBox.setText("<h3>Custom Message</h3>");
+
+    // 添加复选框
+    QCheckBox* checkBox = new QCheckBox("Don't show this again");
+    msgBox.setCheckBox(checkBox);
+
+    // 添加详细文本
+    msgBox.setDetailedText("Additional information:\nLine 1\nLine 2\nLine 3");
+
+    msgBox.exec();
+
+    if (checkBox->isChecked()) {
+        qDebug() << "User checked 'Don't show again'";
+    }
+}
+```
+
+### 9.3 QMainWindow、QWidget、QDialog 区别
+
+```cpp
+/*
+ * ========== 三种窗口类型区别 ==========
+ *
+ * QWidget:
+ *   - 最基础的窗口类
+ *   - 可以作为顶层窗口或子窗口
+ *   - 没有预定义的布局结构
+ *   - 适合自定义窗口
+ *
+ * QMainWindow:
+ *   - 专为主窗口设计
+ *   - 包含菜单栏、工具栏、状态栏、停靠窗口
+ *   - 有中心部件区域
+ *   - 适合应用程序主窗口
+ *
+ * QDialog:
+ *   - 专为对话框设计
+ *   - 有模态/非模态模式
+ *   - 返回值（Accepted/Rejected）
+ *   - 适合对话框和设置窗口
+ */
+
+// ========== QMainWindow 示例 ==========
+
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow(QWidget* parent = nullptr) : QMainWindow(parent) {
+        setWindowTitle("Main Window");
+        resize(800, 600);
+
+        // ========== 菜单栏 ==========
+        QMenuBar* menuBar = this->menuBar();
+
+        QMenu* fileMenu = menuBar->addMenu("File");
+        fileMenu->addAction("New", this, &MainWindow::newFile, QKeySequence::New);
+        fileMenu->addAction("Open", this, &MainWindow::openFile, QKeySequence::Open);
+        fileMenu->addSeparator();
+        fileMenu->addAction("Exit", this, &MainWindow::close, QKeySequence::Quit);
+
+        QMenu* editMenu = menuBar->addMenu("Edit");
+        editMenu->addAction("Undo", this, &MainWindow::undo, QKeySequence::Undo);
+        editMenu->addAction("Redo", this, &MainWindow::redo, QKeySequence::Redo);
+
+        QMenu* helpMenu = menuBar->addMenu("Help");
+        helpMenu->addAction("About", this, &MainWindow::about);
+
+        // ========== 工具栏 ==========
+        QToolBar* toolBar = addToolBar("Main Toolbar");
+        toolBar->addAction("New", this, &MainWindow::newFile);
+        toolBar->addAction("Open", this, &MainWindow::openFile);
+        toolBar->addSeparator();
+        toolBar->addAction("Save", this, &MainWindow::saveFile);
+
+        // 添加工具栏按钮
+        QPushButton* toolButton = new QPushButton("Tool");
+        toolBar->addWidget(toolButton);
+
+        // ========== 状态栏 ==========
+        QStatusBar* statusBar = this->statusBar();
+        statusBar->showMessage("Ready", 3000);
+
+        // 添加永久部件
+        statusBar->addPermanentWidget(new QLabel("Line: 1"));
+        statusBar->addPermanentWidget(new QLabel("Col: 1"));
+
+        // ========== 中心部件 ==========
+        QTextEdit* textEdit = new QTextEdit();
+        setCentralWidget(textEdit);
+
+        // ========== 停靠窗口 ==========
+        QDockWidget* dock = new QDockWidget("Project", this);
+        dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+
+        QListWidget* projectList = new QListWidget();
+        projectList->addItem("File 1");
+        projectList->addItem("File 2");
+        dock->setWidget(projectList);
+
+        addDockWidget(Qt::LeftDockWidgetArea, dock);
+
+        // 允许停靠窗口关闭
+        dock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+    }
+
+private slots:
+    void newFile() { qDebug() << "New file"; }
+    void openFile() { qDebug() << "Open file"; }
+    void saveFile() { qDebug() << "Save file"; }
+    void undo() { qDebug() << "Undo"; }
+    void redo() { qDebug() << "Redo"; }
+    void about() {
+        QMessageBox::about(this, "About", "My Application v1.0");
+    }
+
+private:
+};
+
+// ========== QWidget 示例 ==========
+
+class CustomWidget : public QWidget {
+public:
+    CustomWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        setWindowTitle("Custom Widget");
+        resize(400, 300);
+
+        // 窗口标志
+        setWindowFlags(Qt::Window | Qt::WindowMinimizeButtonHint | Qt::WindowMaximizeButtonHint);
+
+        QVBoxLayout* layout = new QVBoxLayout(this);
+        layout->addWidget(new QLabel("This is a custom QWidget"));
+
+        // 可以作为顶层窗口
+        // w.show();
+
+        // 也可以嵌入其他窗口
+        // layout->addWidget(w);
+    }
+};
+
+// ========== QDialog 示例 ==========
+
+class SettingsDialog : public QDialog {
+public:
+    SettingsDialog(QWidget* parent = nullptr) : QDialog(parent) {
+        setWindowTitle("Settings");
+        setModal(true);  // 设置为模态
+
+        QVBoxLayout* layout = new QVBoxLayout(this);
+
+        // 设置选项
+        QCheckBox* darkMode = new QCheckBox("Dark Mode");
+        layout->addWidget(darkMode);
+
+        QComboBox* language = new QComboBox();
+        language->addItems({"English", "中文", "日本語"});
+        layout->addWidget(language);
+
+        // 按钮
+        QDialogButtonBox* buttons = new QDialogButtonBox(
+            QDialogButtonBox::Ok | QDialogButtonBox::Cancel | QDialogButtonBox::Apply);
+
+        connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+        connect(buttons->button(QDialogButtonBox::Apply), &QPushButton::clicked, [=]() {
+            qDebug() << "Apply settings";
+        });
+
+        layout->addWidget(buttons);
+    }
+};
+```
+
+---
+
+## 十、Qt 编译系统 ⭐
+
+### 10.1 moc（元对象编译器）
+
+```cpp
+/*
+ * ========== moc 工作原理 ==========
+ *
+ * 1. moc 预处理含有 Q_OBJECT 宏的头文件
+ * 2. 生成 moc_*.cpp 文件，包含：
+ *    - 元对象数据（QMetaObject）
+ *    - 信号的实现
+ *    - qt_metacall、qt_metacast 等函数
+ * 3. moc_*.cpp 与其他源文件一起编译链接
+ */
+
+// ========== 需要 moc 处理的情况 ==========
+
+// 1. 使用 Q_OBJECT 宏
+class MyObject : public QObject {
+    Q_OBJECT  // 必须由 moc 处理
+public:
+    MyObject(QObject* parent = nullptr) : QObject(parent) {}
+
+signals:
+    void mySignal();  // moc 会生成实现
+
+public slots:
+    void mySlot() {}  // 标记为槽
+};
+
+// 2. 使用 Q_PROPERTY
+class Widget : public QWidget {
+    Q_OBJECT
+    Q_PROPERTY(QString title READ title WRITE setTitle NOTIFY titleChanged)
+
+public:
+    QString title() const { return m_title; }
+    void setTitle(const QString& title) {
+        if (m_title != title) {
+            m_title = title;
+            emit titleChanged(title);
+        }
+    }
+
+signals:
+    void titleChanged(const QString& title);
+
+private:
+    QString m_title;
+};
+
+// 3. 使用 Q_ENUM / Q_FLAG
+class MyClass : public QObject {
+    Q_OBJECT
+public:
+    enum Priority {
+        Low,
+        Normal,
+        High,
+        Urgent
+    };
+    Q_ENUM(Priority)  // 注册到元对象系统
+};
+
+// 4. 声明信号
+class Emitter : public QObject {
+    Q_OBJECT
+public:
+    Emitter(QObject* parent = nullptr) : QObject(parent) {}
+
+    void emitSignal() {
+        emit dataReady(42);  // 信号由 moc 实现
+    }
+
+signals:
+    void dataReady(int value);
+};
+
+/*
+ * ========== moc 命令行使用 ==========
+ *
+ * moc header.h -o moc_header.cpp
+ *
+ * Qt 的构建系统（qmake/CMake）会自动调用 moc
+ */
+```
+
+### 10.2 qmake
+
+```qmake
+# ========== .pro 文件基本结构 ==========
+
+# 项目模板
+TEMPLATE = app
+# TEMPLATE 值:
+#   app  - 应用程序
+#   lib  - 库
+#   subdirs - 子目录项目
+#   aux  - 辅助项目（不编译）
+
+# 目标名称
+TARGET = MyApplication
+# Windows: MyApplication.exe
+# Linux/macOS: MyApplication
+
+# Qt 模块
+QT += core gui widgets
+# 可用模块:
+#   core     - 核心功能（默认包含）
+#   gui      - GUI 功能（依赖 core）
+#   widgets  - 控件（依赖 gui）
+#   network  - 网络功能
+#   sql      - 数据库
+#   xml      - XML 处理
+#   charts   - 图表
+#   printsupport - 打印支持
+#   testlib  - 测试框架
+
+# 排除模块
+QT -= gui
+
+# ========== 源文件 ==========
+SOURCES += main.cpp \
+           widget.cpp \
+           model.cpp
+
+# 或使用通配符
+SOURCES += *.cpp
+
+# ========== 头文件 ==========
+HEADERS += widget.h \
+           model.h
+
+# ========== UI 文件 ==========
+FORMS += widget.ui \
+         dialog.ui
+
+# ========== 资源文件 ==========
+RESOURCES += resources.qrc
+
+# ========== 编译配置 ==========
+CONFIG += c++17  # C++ 标准
+CONFIG += debug_and_release  # 同时生成 debug 和 release
+CONFIG += console  # 控制台程序（Windows）
+CONFIG += warn_on  # 显示警告
+CONFIG += exceptions  # 启用异常
+CONFIG += rtti  # 启用 RTTI
+CONFIG += stl  # 启用 STL
+
+# 定义宏
+DEFINES += QT_DEPRECATED_WARNINGS
+DEFINES += MY_APP_VERSION=\\\"1.0.0\\\"
+
+# ========== 包含路径 ==========
+INCLUDEPATH += /usr/local/include \
+               ./include
+
+# ========== 库路径和链接 ==========
+LIBS += -L/usr/local/lib -lmylib
+LIBS += -lxml2 -lz
+# Windows:
+LIBS += C:/mylib/mylib.lib
+
+# ========== 条件编译 ==========
+# 平台判断
+win32 {
+    SOURCES += windows_specific.cpp
+    LIBS += -luser32 -lgdi32
+    DEFINES += WINDOWS_OS
+}
+
+unix:!macx {
+    SOURCES += linux_specific.cpp
+    LIBS += -lpthread
+    TARGET = myapp-linux
+}
+
+macx {
+    SOURCES += mac_specific.cpp
+    LIBS += -framework Cocoa
+    TARGET = myapp-mac
+}
+
+# Debug/Release 区分
+CONFIG(debug, debug|release) {
+    SOURCES += debug_tools.cpp
+    DEFINES += DEBUG_MODE
+    TARGET = myapp_d
+} else {
+    DEFINES += NDEBUG
+    TARGET = myapp
+}
+
+# ========== 自定义编译规则 ==========
+# 指定 moc 生成的文件位置
+MOC_DIR = build/moc
+OBJECTS_DIR = build/obj
+RCC_DIR = build/rcc
+UI_DIR = build/ui
+
+# ========== 子目录项目 ==========
+TEMPLATE = subdirs
+SUBDIRS = app \
+          lib1 \
+          lib2
+
+app.depends = lib1 lib2  # app 依赖 lib1 和 lib2
+```
+
+### 10.3 CMake
+
+```cmake
+# ========== CMakeLists.txt 基本结构 ==========
+
+cmake_minimum_required(VERSION 3.16)
+project(MyApp VERSION 1.0.0 LANGUAGES CXX)
+
+# 设置 C++ 标准
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 自动处理 Qt 的 moc、rcc、uic
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
+
+# ========== 查找 Qt 包 ==========
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets)
+# 或 Qt5:
+# find_package(Qt5 REQUIRED COMPONENTS Core Widgets)
+
+# ========== 创建可执行文件 ==========
+qt_add_executable(MyApp
+    main.cpp
+    widget.cpp
+    widget.h
+    widget.ui
+    resources.qrc
+)
+
+# ========== 链接 Qt 库 ==========
+target_link_libraries(MyApp PRIVATE
+    Qt6::Core
+    Qt6::Widgets
+)
+
+# ========== 包含目录 ==========
+target_include_directories(MyApp PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# ========== 编译定义 ==========
+target_compile_definitions(MyApp PRIVATE
+    QT_DEPRECATED_WARNINGS
+    MY_APP_VERSION="${PROJECT_VERSION}"
+)
+
+# ========== 创建库 ==========
+qt_add_library(MyLib
+    lib.cpp
+    lib.h
+)
+
+target_link_libraries(MyLib PUBLIC
+    Qt6::Core
+)
+
+# ========== 安装规则 ==========
+install(TARGETS MyApp
+    BUNDLE DESTINATION .
+    RUNTIME DESTINATION bin
+)
+
+# ========== 条件编译 ==========
+if(WIN32)
+    target_sources(MyApp PRIVATE windows_specific.cpp)
+    target_link_libraries(MyApp PRIVATE user32)
+elseif(UNIX AND NOT APPLE)
+    target_sources(MyApp PRIVATE linux_specific.cpp)
+    target_link_libraries(MyApp PRIVATE pthread)
+elseif(APPLE)
+    target_sources(MyApp PRIVATE mac_specific.cpp)
+endif()
+
+# ========== Debug/Release 配置 ==========
+set(CMAKE_CONFIGURATION_TYPES "Debug;Release")
+set(CMAKE_DEBUG_POSTFIX "_d")
+
+# ========== 子目录项目 ==========
+add_subdirectory(lib)
+add_subdirectory(app)
+
+# ========== 自定义命令 ==========
+# 生成版本信息
+execute_process(
+    COMMAND git describe --tags --always
+    OUTPUT_VARIABLE GIT_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+target_compile_definitions(MyApp PRIVATE GIT_VERSION="${GIT_VERSION}")
+```
+
+### 10.4 编译流程
+
+```bash
+# ========== Qt 编译完整流程 ==========
+
+# 1. 预处理
+#    - 处理 #include、#define 等预处理指令
+#    - moc 处理 Q_OBJECT 宏，生成 moc_*.cpp
+
+# 2. 编译
+#    - 将 .cpp 和 moc_*.cpp 编译成 .o 文件
+#    - rcc 处理 .qrc 资源文件，生成 qrc_*.cpp
+#    - uic 处理 .ui 文件，生成 ui_*.h
+
+# 3. 链接
+#    - 将所有 .o 文件链接成最终可执行文件
+#    - 链接 Qt 库
+
+# ========== qmake 构建流程 ==========
+qmake project.pro    # 生成 Makefile
+make                  # 编译
+# Windows:
+qmake project.pro
+nmake
+# 或使用 mingw32-make
+
+# ========== CMake 构建流程 ==========
+mkdir build
+cd build
+cmake ..             # 生成 Makefile/VS 项目
+cmake --build .      # 编译
+# 或
+make
+
+# ========== 跨平台编译示例 ==========
+# 为 Windows 编译（从 Linux）
+mingw32-cmake .. -DCMAKE_TOOLCHAIN_FILE=mingw.cmake
+cmake --build .
+
+# 为 macOS 编译（从 Linux）
+osxcross-cmake .. -DCMAKE_TOOLCHAIN_FILE=osx.cmake
+cmake --build .
+```
+
+---
+
+## 十一、Qt 与 Windows API 互操作 ⭐
+
+### 11.1 获取窗口句柄
+
+```cpp
+#include <windows.h>
+
+// ========== 获取 HWND ==========
+void exampleGetHwnd() {
+    QWidget* widget = new QWidget();
+    widget->show();
+
+    // Qt5/Qt6 方式
+    HWND hwnd = reinterpret_cast<HWND>(widget->winId());
+
+    qDebug() << "HWND:" << hwnd;
+
+    // 验证句柄有效性
+    if (IsWindow(hwnd)) {
+        qDebug() << "Valid window handle";
+    }
+}
+
+// ========== WId 类型定义 ==========
+/*
+ * WId 是 Qt 的窗口标识符类型
+ * Windows: HWND
+ * X11: Window
+ * macOS: NSView*
+ * iOS/macOS: UIView*
+ */
+
+// ========== 获取子窗口句柄 ==========
+void exampleChildHwnd() {
+    QMainWindow* mainWindow = new QMainWindow();
+    QTextEdit* textEdit = new QTextEdit(mainWindow);
+    mainWindow->setCentralWidget(textEdit);
+    mainWindow->show();
+
+    // 获取主窗口句柄
+    HWND mainHwnd = reinterpret_cast<HWND>(mainWindow->winId());
+
+    // 获取子控件句柄
+    HWND editHwnd = reinterpret_cast<HWND>(textEdit->winId());
+
+    qDebug() << "Main HWND:" << mainHwnd;
+    qDebug() << "Edit HWND:" << editHwnd;
+}
+
+// ========== 有效平台判断 ==========
+void crossPlatformExample() {
+    QWidget* widget = new QWidget();
+
+    #ifdef Q_OS_WIN
+        HWND hwnd = reinterpret_cast<HWND>(widget->winId());
+        // Windows 特定操作
+    #elif defined(Q_OS_LINUX)
+        // X11 特定操作
+    #elif defined(Q_OS_MACOS)
+        // macOS 特定操作
+    #endif
+}
+```
+
+### 11.2 Qt 调用 Windows API
+
+```cpp
+// ========== 窗口操作 ==========
+
+void windowOperations() {
+    QWidget* widget = new QWidget();
+    widget->setWindowTitle("Windows API Demo");
+    widget->resize(400, 300);
+    widget->show();
+
+    HWND hwnd = reinterpret_cast<HWND>(widget->winId());
+
+    // ========== 设置窗口位置 ==========
+    SetWindowPos(hwnd, HWND_TOP, 100, 100, 400, 300, SWP_SHOWWINDOW);
+
+    // ========== 获取窗口矩形 ==========
+    RECT rect;
+    GetWindowRect(hwnd, &rect);
+    qDebug() << "Window rect:" << rect.left << rect.top << rect.right << rect.bottom;
+
+    // ========== 获取客户区矩形 ==========
+    RECT clientRect;
+    GetClientRect(hwnd, &clientRect);
+    qDebug() << "Client rect:" << clientRect.right << clientRect.bottom;
+
+    // ========== 设置窗口标题 ==========
+    SetWindowText(hwnd, L"New Title from Windows API");
+
+    // ========== 显示/隐藏窗口 ==========
+    ShowWindow(hwnd, SW_MINIMIZE);  // 最小化
+    Sleep(1000);
+    ShowWindow(hwnd, SW_RESTORE);   // 恢复
+
+    // ========== 窗口动画 ==========
+    // 淡入效果
+    AnimateWindow(hwnd, 500, AW_BLEND | AW_ACTIVATE);
+}
+
+// ========== 系统托盘 ==========
+
+class SystemTrayIcon : public QObject {
+    Q_OBJECT
+public:
+    SystemTrayIcon(QObject* parent = nullptr) : QObject(parent) {
+        // 使用 Qt 的托盘功能
+        m_trayIcon = new QSystemTrayIcon(this);
+        m_trayIcon->setIcon(QIcon(":/icons/app.png"));
+        m_trayIcon->setToolTip("My Application");
+
+        // 创建菜单
+        QMenu* menu = new QMenu();
+        menu->addAction("Show", this, &SystemTrayIcon::showWindow);
+        menu->addAction("Quit", this, &SystemTrayIcon::quit);
+        m_trayIcon->setContextMenu(menu);
+
+        m_trayIcon->show();
+    }
+
+    void setWindow(QWidget* window) {
+        m_window = window;
+        connect(m_trayIcon, &QSystemTrayIcon::activated, [=](QSystemTrayIcon::ActivationReason reason) {
+            if (reason == QSystemTrayIcon::DoubleClick) {
+                showWindow();
+            }
+        });
+    }
+
+private slots:
+    void showWindow() {
+        if (m_window) {
+            m_window->showNormal();
+            m_window->raise();
+            m_window->activateWindow();
+        }
+    }
+
+    void quit() {
+        qApp->quit();
+    }
+
+private:
+    QSystemTrayIcon* m_trayIcon;
+    QWidget* m_window = nullptr;
+};
+
+// ========== 注册表操作 ==========
+
+#include <QSettings>
+
+void registryOperations() {
+    // Qt 方式（跨平台）
+    QSettings settings("HKEY_CURRENT_USER\\Software\\MyCompany", QSettings::NativeFormat);
+
+    // 写入
+    settings.setValue("MyApp/Version", "1.0.0");
+    settings.setValue("MyApp/Path", "C:\\Program Files\\MyApp");
+
+    // 读取
+    QString version = settings.value("MyApp/Version").toString();
+
+    // 删除
+    settings.remove("MyApp");
+
+    // ========== Windows API 方式 ==========
+    HKEY hKey;
+    LPCWSTR subKey = L"Software\\MyCompany\\MyApp";
+
+    // 打开注册表键
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, subKey, 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+        // 写入值
+        const wchar_t* value = L"1.0.0";
+        RegSetValueEx(hKey, L"Version", 0, REG_SZ, (const BYTE*)value, (wcslen(value) + 1) * sizeof(wchar_t));
+
+        RegCloseKey(hKey);
+    }
+
+    // 读取值
+    DWORD type, size;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, subKey, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        // 获取大小
+        RegQueryValueEx(hKey, L"Version", NULL, &type, NULL, &size);
+
+        // 读取数据
+        wchar_t* buffer = new wchar_t[size / sizeof(wchar_t)];
+        RegQueryValueEx(hKey, L"Version", NULL, &type, (BYTE*)buffer, &size);
+        qDebug() << "Version:" << QString::fromWCharArray(buffer);
+        delete[] buffer;
+
+        RegCloseKey(hKey);
+    }
+}
+
+// ========== DLL 加载 ==========
+
+void dllOperations() {
+    // Qt 方式
+    QLibrary library("mylib.dll");
+    if (library.load()) {
+        // 解析函数
+        typedef void (*MyFunction)();
+        MyFunction myFunc = (MyFunction)library.resolve("myFunction");
+
+        if (myFunc) {
+            myFunc();
+        }
+
+        library.unload();
+    }
+
+    // ========== Windows API 方式 ==========
+    HINSTANCE hDll = LoadLibrary(L"mylib.dll");
+    if (hDll) {
+        // 获取函数地址
+        typedef void (*MyFunction)();
+        MyFunction myFunc = (MyFunction)GetProcAddress(hDll, "myFunction");
+
+        if (myFunc) {
+            myFunc();
+        }
+
+        FreeLibrary(hDll);
+    }
+}
+
+// ========== Windows 消息处理 ==========
+
+class NativeEventWidget : public QWidget {
+protected:
+    // 处理 Windows 消息
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override#else
+    bool nativeEvent(const QByteArray& eventType, void* message, long* result) override#endif
+    {
+        if (eventType == "windows_generic_MSG") {
+            MSG* msg = static_cast<MSG*>(message);
+
+            if (msg->message == WM_KEYDOWN) {
+                // 处理键盘按下
+                WPARAM key = msg->wParam;
+                qDebug() << "Key pressed:" << key;
+
+                // 可以返回 true 阻止消息继续传递
+                // *result = 0;
+                // return true;
+            }
+
+            if (msg->message == WM_SIZE) {
+                // 窗口大小改变
+                int width = LOWORD(msg->lParam);
+                int height = HIWORD(msg->lParam);
+                qDebug() << "Size:" << width << height;
+            }
+
+            if (msg->message == WM_POWERBROADCAST) {
+                // 系统电源事件
+                if (msg->wParam == PBT_APMSUSPEND) {
+                    qDebug() << "System suspending";
+                    saveData();
+                }
+            }
+        }
+
+        return QWidget::nativeEvent(eventType, message, result);
+    }
+
+private:
+    void saveData() {
+        // 保存数据
+    }
+};
+
+// ========== 设备通知 ==========
+
+class DeviceNotificationWidget : public QWidget {
+    Q_OBJECT
+public:
+    DeviceNotificationWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        registerDeviceNotification();
+    }
+
+    ~DeviceNotificationWidget() {
+        unregisterDeviceNotification();
+    }
+
+protected:
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override#else
+    bool nativeEvent(const QByteArray& eventType, void* message, long* result) override#endif
+    {
+        if (eventType == "windows_generic_MSG") {
+            MSG* msg = static_cast<MSG*>(message);
+
+            if (msg->message == WM_DEVICECHANGE) {
+                onDeviceChange(msg->wParam, msg->lParam);
+            }
+        }
+
+        return QWidget::nativeEvent(eventType, message, result);
+    }
+
+private:
+    HDEVNOTIFY m_hDevNotify = nullptr;
+
+    void registerDeviceNotification() {
+        HWND hwnd = reinterpret_cast<HWND>(winId());
+
+        // 注册 USB 设备通知
+        DEV_BROADCAST_DEVICEINTERFACE filter = {};
+        filter.dbcc_size = sizeof(filter);
+        filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+        // filter.dbcc_classguid = ...;  // 特定设备类型
+
+        m_hDevNotify = RegisterDeviceNotification(
+            hwnd,
+            &filter,
+            DEVICE_NOTIFY_WINDOW_HANDLE
+        );
+    }
+
+    void unregisterDeviceNotification() {
+        if (m_hDevNotify) {
+            UnregisterDeviceNotification(m_hDevNotify);
+            m_hDevNotify = nullptr;
+        }
+    }
+
+    void onDeviceChange(WPARAM wParam, LPARAM lParam) {
+        switch (wParam) {
+            case DBT_DEVICEARRIVAL:
+                qDebug() << "Device connected";
+                break;
+            case DBT_DEVICEREMOVECOMPLETE:
+                qDebug() << "Device removed";
+                break;
+        }
+    }
+};
+```
+
+### 11.3 常用 Windows API 集成
+
+```cpp
+// ========== 文件关联 ==========
+
+void registerFileAssociation() {
+    QString appPath = QCoreApplication::applicationFilePath();
+    QString fileType = "MyApp.File";
+    QString ext = ".myfile";
+
+    QSettings settings("HKEY_CURRENT_USER\\Software\\Classes", QSettings::NativeFormat);
+
+    // 设置文件类型
+    settings.setValue(fileType + "/DefaultIcon/.", appPath + ",0");
+    settings.setValue(fileType + "/shell/ope  n/command/.", "\"" + appPath + "\" \"%1\"");
+
+    // 关联扩展名
+    settings.setValue("." + ext + "/Default", fileType);
+    settings.setValue("." + ext + "/PerceivedType", "text");
+
+    // 通知系统刷新
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
+}
+
+// ========== 启动外部程序 ==========
+
+void startExternalProcess() {
+    // Qt 方式（跨平台）
+    QProcess::startDetached("notepad.exe", {"C:\\test.txt"});
+
+    // Windows API 方式
+    SHELLEXECUTEINFO info = {};
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = L"open";
+    info.lpFile = L"notepad.exe";
+    info.lpParameters = L"C:\\test.txt";
+    info.nShow = SW_SHOW;
+
+    ShellExecuteEx(&info);
+
+    // 使用 CreateProcess
+    STARTUPINFO si = {};
+    PROCESS_INFORMATION pi = {};
+    si.cb = sizeof(si);
+
+    wchar_t cmd[] = L"notepad.exe C:\\test.txt";
+    if (CreateProcess(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        // 等待进程结束
+        WaitForSingleObject(pi.hProcess, INFINITE);
+
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+}
+
+// ========== 获取系统信息 ==========
+
+void getSystemInfo() {
+    // Qt 方式
+    qDebug() << "Computer name:" << QSysInfo::machineHostName();
+    qDebug() << "OS:" << QSysInfo::prettyProductName();
+    qDebug() << "Kernel:" << QSysInfo::kernelType();
+    qDebug() << "Architecture:" << QSysInfo::currentCpuArchitecture();
+    qDebug() << "Word size:" << QSysInfo::WordSize;
+
+    // Windows API 方式
+    // 获取内存信息
+    MEMORYSTATUSEX memStatus = {};
+    memStatus.dwLength = sizeof(memStatus);
+    GlobalMemoryStatusEx(&memStatus);
+
+    qDebug() << "Total memory:" << memStatus.ullTotalPhys / (1024 * 1024) << "MB";
+    qDebug() << "Available memory:" << memStatus.ullAvailPhys / (1024 * 1024) << "MB";
+    qDebug() << "Memory usage:" << memStatus.dwMemoryLoad << "%";
+
+    // 获取磁盘信息
+    ULARGE_INTEGER freeBytes, totalBytes;
+    if (GetDiskFreeSpaceEx(L"C:", &freeBytes, &totalBytes, NULL)) {
+        qDebug() << "Total disk:" << totalBytes.QuadPart / (1024 * 1024 * 1024) << "GB";
+        qDebug() << "Free disk:" << freeBytes.QuadPart / (1024 * 1024 * 1024) << "GB";
+    }
+
+    // 获取系统版本
+    OSVERSIONINFOEX osvi = {};
+    osvi.dwOSVersionInfoSize = sizeof(osvi);
+    // GetVersionEx 已弃用，使用其他方式
+}
+```
+
+---
+
+## 十二、C++ 标准库在 Qt 中的应用 ⭐
+
+### 12.1 容器类对比
+
+```cpp
+// ========== STL 容器 vs Qt 容器 ==========
+
+void containerComparison() {
+    // ========== std::vector vs QVector ==========
+    std::vector<int> stlVec = {1, 2, 3, 4, 5};
+    QVector<int> qtVec = {1, 2, 3, 4, 5};
+
+    // 访问元素
+    int stlValue = stlVec[0];
+    int qtValue = qtVec[0];
+
+    // 添加元素
+    stlVec.push_back(6);
+    qtVec.append(6);
+
+    // 迭代器
+    for (auto it = stlVec.begin(); it != stlVec.end(); ++it) {
+        qDebug() << *it;
+    }
+
+    for (QVector<int>::iterator it = qtVec.begin(); it != qtVec.end(); ++it) {
+        qDebug() << *it;
+    }
+
+    // 范围 for（C++11）
+    for (const auto& val : stlVec) {
+        qDebug() << val;
+    }
+
+    for (const int& val : qtVec) {
+        qDebug() << val;
+    }
+
+    // ========== std::map vs QMap ==========
+    std::map<QString, int> stlMap;
+    QMap<QString, int> qtMap;
+
+    // 插入
+    stlMap["key1"] = 1;
+    stlMap.insert({"key2", 2});
+
+    qtMap["key1"] = 1;
+    qtMap.insert("key2", 2);
+
+    // 查找
+    auto stlIt = stlMap.find("key1");
+    if (stlIt != stlMap.end()) {
+        qDebug() << "Found:" << stlIt->second;
+    }
+
+    auto qtIt = qtMap.find("key1");
+    if (qtIt != qtMap.end()) {
+        qDebug() << "Found:" << qtIt.value();
+    }
+
+    // Qt 的 QMap 提供 [] 操作符，找不到会自动创建
+    int value = qtMap["nonexistent"];  // 返回 0（默认值）
+
+    // ========== std::unordered_map vs QHash ==========
+    std::unordered_map<QString, int> stlHash;
+    QHash<QString, int> qtHash;
+
+    // QHash 查找更快，但不排序
+    // QMap 排序，查找 O(log n)
+    // QHash 不排序，查找 O(1) 平均
+}
+
+// ========== 隐式共享（写时复制）==========
+
+void implicitSharing() {
+    /*
+     * Qt 容器使用隐式共享（COW - Copy On Write）
+     * - 复制容器时不复制数据，只增加引用计数
+     * - 写入时才真正复制数据
+     * - 提高效率，减少内存使用
+     */
+
+    QVector<int> vec1 = {1, 2, 3, 4, 5};
+    QVector<int> vec2 = vec1;  // 共享数据，不复制
+
+    qDebug() << "vec1 data:" << vec1.data();
+    qDebug() << "vec2 data:" << vec2.data();  // 相同地址
+
+    vec2[0] = 99;  // 写入时才复制数据
+    vec2.detach();  // 强制分离
+
+    // detach() 确保拥有独立副本
+    // constData() 返回常量指针，不会触发分离
+}
+
+// ========== 使用 STL 算法与 Qt 容器 ==========
+
+void stlAlgorithmsWithQt() {
+    QVector<int> numbers = {5, 2, 8, 1, 9, 3};
+
+    // 使用 STL 算法
+    std::sort(numbers.begin(), numbers.end());
+    // numbers: {1, 2, 3, 5, 8, 9}
+
+    // 查找
+    auto it = std::find(numbers.begin(), numbers.end(), 5);
+    if (it != numbers.end()) {
+        qDebug() << "Found 5 at index:" << std::distance(numbers.begin(), it);
+    }
+
+    // 计数
+    int count = std::count(numbers.begin(), numbers.end(), 5);
+
+    // Lambda + STL 算法
+    int sum = std::accumulate(numbers.begin(), numbers.end(), 0);
+
+    // 条件查找
+    auto greaterThan5 = std::find_if(numbers.begin(), numbers.end(), [](int val) {
+        return val > 5;
+    });
+
+    // 复制
+    QVector<int> dest;
+    std::copy_if(numbers.begin(), numbers.end(), std::back_inserter(dest), [](int val) {
+        return val > 3;
+    });
+}
+```
+
+### 12.2 字符串处理
+
+```cpp
+// ========== QString vs std::string ==========
+
+void stringComparison() {
+    // ========== 创建字符串 ==========
+    std::string stlStr = "Hello";
+    QString qtStr = "Hello";
+    QString qtStr2 = QString("Hello");
+    QString qtStr3 = QStringLiteral("Hello");  // 编译期优化（推荐）
+
+    // ========== 相互转换 ==========
+    // QString -> std::string
+    std::string str1 = qtStr.toStdString();
+    std::string str2 = qtStr.toLocal8Bit().toStdString();
+    std::string str3 = qtStr.toUtf8().toStdString();
+
+    // std::string -> QString
+    QString qtStr4 = QString::fromStdString(stlStr);
+    QString qtStr5 = QString::fromLocal8Bit(stlStr.c_str());
+    QString qtStr6 = QString::fromUtf8(stlStr.c_str());
+
+    // ========== 字符串操作 ==========
+    QString text = "Hello World";
+
+    // 大小写
+    QString upper = text.toUpper();      // "HELLO WORLD"
+    QString lower = text.toLower();      // "hello world"
+
+    // 查找
+    int index = text.indexOf("World");   // 6
+    bool contains = text.contains("World");  // true
+    bool starts = text.startsWith("Hello");  // true
+    bool ends = text.endsWith("World");      // true
+
+    // 替换
+    QString replaced = text;
+    replaced.replace("World", "Qt");  // "Hello Qt"
+
+    // 分割
+    QStringList parts = text.split(" ");
+    // parts: ["Hello", "World"]
+
+    // 连接
+    QString joined = parts.join(", ");  // "Hello, World"
+
+    // 格式化
+    int age = 25;
+    QString formatted = QString("Age: %1").arg(age);
+    QString formatted2 = QString("Name: %1, Age: %2").arg("John").arg(age);
+
+    // 数字转换
+    QString numStr = QString::number(3.14159, 'f', 2);  // "3.14"
+    double num = numStr.toDouble();  // 3.14
+
+    // ========== 编码转换 ==========
+    QString unicode = QString::fromUtf8("中文测试");
+    QByteArray utf8 = unicode.toUtf8();
+    QByteArray gbk = unicode.toLocal8Bit();  // 在中文 Windows 上是 GBK
+
+    // UTF-16
+    QString::const_iterator it;
+    for (it = unicode.constBegin(); it != unicode.constEnd(); ++it) {
+        QChar ch = *it;
+        ushort code = ch.unicode();
+        qDebug() << "Code:" << code;
+    }
+}
+
+// ========== std::string_view 与 QStringView ==========
+
+void stringViewExample() {
+    // C++17 string_view 避免复制
+    std::string_view sv = "Hello World";
+    qDebug() << sv.length();
+
+    // Qt5.10+ QStringView
+    QStringView qv = u"Hello World";
+    qDebug() << qv.length();
+
+    // QString 接受 QStringView 参数
+    QString str = "Hello";
+    QStringView view(str);
+    qDebug() << view;  // 不复制数据
+}
+```
+
+### 12.3 智能指针
+
+```cpp
+// ========== std::unique_ptr 与 Qt ==========
+void uniquePtrExample() {
+    // 独占所有权
+    std::unique_ptr<QWidget> widget = std::make_unique<QWidget>();
+    widget->setWindowTitle("Unique Ptr Demo");
+    widget->show();
+
+    // 移动语义
+    std::unique_ptr<QWidget> widget2 = std::move(widget);
+    // widget 现在为空
+
+    // 自定义删除器
+    auto deleter = [](QWidget* w) {
+        qDebug() << "Custom deleter";
+        w->deleteLater();  // 使用 Qt 的删除方式
+    };
+    std::unique_ptr<QWidget, decltype(deleter)> widget3(new QWidget, deleter);
+}
+
+// ========== std::shared_ptr 与 Qt ==========
+void sharedPtrExample() {
+    // 共享所有权
+    std::shared_ptr<QWidget> widget = std::make_shared<QWidget>();
+    std::shared_ptr<QWidget> widget2 = widget;  // 引用计数 +1
+
+    qDebug() << "Use count:" << widget.use_count();  // 2
+
+    // 使用 weak_ptr 避免循环引用
+    std::weak_ptr<QWidget> weakWidget = widget;
+
+    // 检查对象是否存活
+    if (auto locked = weakWidget.lock()) {
+        locked->setWindowTitle("Still alive");
+    }
+
+    widget.reset();
+    widget2.reset();
+    // weakWidget 现在过期
+    if (weakWidget.expired()) {
+        qDebug() << "Widget destroyed";
+    }
+}
+
+// ========== Qt 智能指针 ==========
+void qtSmartPointerExample() {
+    // ========== QPointer ==========
+    // 监控 QObject 指针，对象被删除时自动置空
+    QPointer<QPushButton> ptr = new QPushButton();
+    ptr->setText("QPointer Demo");
+
+    if (ptr) {  // 检查对象是否仍然存在
+        ptr->show();
+    }
+
+    delete ptr;  // 或对象被其他地方删除
+    if (!ptr) {
+        qDebug() << "QPointer is now null";
+    }
+
+    // ========== QSharedPointer ==========
+    // 引用计数智能指针（类似 std::shared_ptr）
+    QSharedPointer<QString> str = QSharedPointer<QString>::create("Hello");
+    QSharedPointer<QString> str2 = str;  // 引用计数 +1
+
+    qDebug() << "Ref count:" << str.use_count();  // 2
+
+    // ========== QWeakPointer ==========
+    // 弱引用，不影响引用计数
+    QWeakPointer<QString> weak = str;
+    if (!weak.isNull()) {
+        QSharedPointer<QString> locked = weak.toStrongRef();
+        if (locked) {
+            qDebug() << *locked;  // 安全访问
+        }
+    }
+
+    // ========== QScopedPointer ==========
+    // 作用域指针（类似 std::unique_ptr）
+    QScopedPointer<QTimer> timer(new QTimer());
+    timer->start(1000);
+    // 作用域结束时自动删除
+}
+
+// ========== 混合使用注意事项 ==========
+void mixedPointers() {
+    /*
+     * 不要混用 new/delete 和智能指针
+     * Qt 的父子对象管理不要与智能指针混用
+     */
+
+    // 错误：有父对象的指针不要用智能指针管理
+    // QWidget* parent = new QWidget();
+    // std::unique_ptr<QWidget> child(new QPushButton(parent));  // 会导致双重删除
+
+    // 正确：只使用一种管理方式
+    // 方式1：Qt 父子管理
+    QWidget* parent = new QWidget();
+    QPushButton* child = new QPushButton(parent);
+
+    // 方式2：智能指针管理
+    auto parent2 = std::make_unique<QWidget>();
+    auto child2 = std::make_unique<QPushButton>(parent2.get());
+}
+```
+
+### 12.4 Lambda 表达式与 STL 算法
+
+```cpp
+// ========== Lambda 表达式在 Qt 中的应用 ==========
+
+void lambdaInQt() {
+    // ========== 连接信号槽 ==========
+    QPushButton* button = new QPushButton("Click me");
+
+    // Lambda 作为槽（Qt5 风格）
+    connect(button, &QPushButton::clicked, [=]() {
+        qDebug() << "Button clicked";
+    });
+
+    // 捕获上下文
+    QString message = "Hello";
+    connect(button, &QPushButton::clicked, [message]() {
+        qDebug() << message;  // 按值捕获
+    });
+
+    // 捕获 this
+    class MyClass : public QObject {
+    public:
+        MyClass() {
+            QPushButton* btn = new QPushButton();
+            connect(btn, &QPushButton::clicked, this, [this]() {
+                this->handleClick();
+            });
+        }
+
+        void handleClick() {
+            qDebug() << "Clicked";
+        }
+    };
+
+    // ========== std::function 与 std::bind ==========
+
+    // std::function 包装可调用对象
+    std::function<QString(int)> formatter = [](int value) {
+        return QString("Value: %1").arg(value);
+    };
+    qDebug() << formatter(42);
+
+    // std::bind 绑定参数
+    class Calculator {
+    public:
+        int add(int a, int b) { return a + b; }
+    };
+
+    Calculator calc;
+    // 绑定第一个参数为 10
+    auto addTen = std::bind(&Calculator::add, &calc, 10, std::placeholders::_1);
+    qDebug() << "10 + 5 =" << addTen(5);
+
+    // ========== Qt 并发 + Lambda ==========
+    QVector<int> numbers = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+
+    // 使用 QtConcurrent::map
+    QtConcurrent::map(numbers, [](int& value) {
+        value = value * value;
+    }).waitForFinished();
+
+    // 过滤
+    auto future = QtConcurrent::filtered(numbers, [](int value) {
+        return value > 25;
+    });
+
+    QList<int> result = future.results();
+}
+```
+
+### 12.5 完整示例：Qt + STL
+
+```cpp
+// ========== 使用 STL 容器存储 Qt 对象 ==========
+
+class ContactManager {
+public:
+    struct Contact {
+        QString name;
+        QString phone;
+        QString email;
+    };
+
+    void addContact(const Contact& contact) {
+        m_contacts.push_back(contact);
+    }
+
+    // 使用 STL 算法
+    QVector<Contact> findByName(const QString& name) const {
+        QVector<Contact> result;
+        std::copy_if(m_contacts.begin(), m_contacts.end(),
+                     std::back_inserter(result),
+                     [&name](const Contact& c) {
+            return c.name.contains(name, Qt::CaseInsensitive);
+        });
+        return result;
+    }
+
+    void sortByName() {
+        std::sort(m_contacts.begin(), m_contacts.end(),
+                  [](const Contact& a, const Contact& b) {
+            return a.name < b.name;
+        });
+    }
+
+    void removeDuplicates() {
+        std::sort(m_contacts.begin(), m_contacts.end(),
+                  [](const Contact& a, const Contact& b) {
+            return a.phone < b.phone;
+        });
+
+        auto last = std::unique(m_contacts.begin(), m_contacts.end(),
+                                [](const Contact& a, const Contact& b) {
+            return a.phone == b.phone;
+        });
+
+        m_contacts.erase(last, m_contacts.end());
+    }
+
+private:
+    QVector<Contact> m_contacts;
+};
+
+// ========== 使用 std::optional (C++17) ==========
+#include <optional>
+
+std::optional<int> parseNumber(const QString& str) {
+    bool ok;
+    int value = str.toInt(&ok);
+    if (ok) {
+        return value;
+    }
+    return std::nullopt;
+}
+
+void optionalExample() {
+    auto result = parseNumber("42");
+    if (result) {
+        qDebug() << "Value:" << *result;
+    } else {
+        qDebug() << "Invalid number";
+    }
+
+    // 提供默认值
+    int value = parseNumber("invalid").value_or(0);
+}
+
+// ========== 使用 std::variant (C++17) ==========
+#include <variant>
+
+using ConfigValue = std::variant<int, double, QString, bool>;
+
+void printConfig(const ConfigValue& value) {
+    std::visit([](auto&& arg) {
+        using T = std::decay_t<decltype(arg)>;
+        if constexpr (std::is_same_v<T, QString>) {
+            qDebug() << "String:" << arg;
+        } else if constexpr (std::is_same_v<T, int>) {
+            qDebug() << "Int:" << arg;
+        } else if constexpr (std::is_same_v<T, double>) {
+            qDebug() << "Double:" << arg;
+        } else if constexpr (std::is_same_v<T, bool>) {
+            qDebug() << "Bool:" << arg;
+        }
+    }, value);
+}
+
+// ========== 使用 std::chrono 与 QTimer ==========
+#include <chrono>
+
+void chronoExample() {
+    using namespace std::chrono;
+
+    // 获取当前时间
+    auto now = system_clock::now();
+    auto time_t_now = system_clock::to_time_t(now);
+    qDebug() << "Current time:" << ctime(&time_t_now);
+
+    // 计算时间差
+    auto start = high_resolution_clock::now();
+
+    // 执行操作
+    QThread::msleep(100);
+
+    auto end = high_resolution_clock::now();
+    auto duration = duration_cast<milliseconds>(end - start);
+    qDebug() << "Duration:" << duration.count() << "ms";
+}
+```
+
+---
+
+## 十三、常见面试问题汇总 ⭐
+
+### 13.1 信号槽相关问题
+
+**Q1: 信号槽的连接方式有哪些？区别是什么？**
+
+```
+Qt::AutoConnection（默认）：
+  - 同线程：DirectConnection（直接调用）
+  - 跨线程：QueuedConnection（队列调用）
+
+Qt::DirectConnection：
+  - 槽函数在信号发射线程立即执行
+  - 同步调用，信号发射后槽函数立即执行完
+
+Qt::QueuedConnection：
+  - 槽函数进入接收者线程的事件队列
+  - 异步调用，信号发射后立即返回
+
+Qt::BlockingQueuedConnection：
+  - 信号发射线程会阻塞等待槽函数执行完成
+  - 只能跨线程使用，同线程会死锁
+
+Qt::UniqueConnection：
+  - 防止重复连接
+  - 可与其他标志位或运算
+```
+
+**Q2: 跨线程信号槽在哪個线程执行？**
+
+```cpp
+// 槽函数在接收者所在线程执行
+// 信号放入接收者线程的事件队列
+
+// 发送线程（主线程）
+QThread* thread = new QThread;
+Worker* worker = new Worker;
+worker->moveToThread(thread);
+
+// connect 默认使用 QueuedConnection
+connect(sender, &Sender::dataChanged, worker, &Worker::processData);
+// dataChanged 在 worker 线程执行
+```
+
+**Q3: 信号可以连接信号吗？**
+
+```cpp
+// 可以，信号可以连接到信号
+connect(button, &QPushButton::clicked, this, &MyClass::buttonClicked);
+connect(this, &MyClass::buttonClicked, this, &MyClass::handleAction);
+
+// 信号转发
+connect(sender, &Sender::valueChanged, this, &MyClass::relaySignal);
+```
+
+**Q4: 如何断开信号槽连接？**
+
+```cpp
+// 断开特定连接
+disconnect(sender, &Sender::valueChanged, receiver, &Receiver::updateValue);
+
+// 断开对象的所有连接
+disconnect(sender);
+
+// 使用连接对象
+QMetaObject::Connection conn = connect(sender, &Sender::valueChanged, ...);
+disconnect(conn);
+```
+
+**Q5: Lambda 表达式作为槽有什么注意事项？**
+
+```cpp
+// 捕获 this（推荐）
+connect(button, &QPushButton::clicked, this, [this]() {
+    this->handleClick();
+});
+
+// 捕获上下文变量
+QString msg = "Hello";
+connect(button, &QPushButton::clicked, [msg]() {
+    qDebug() << msg;  // 按值捕获，安全
+});
+
+// 注意：不要捕获临时对象的指针
+// 错误示例：
+// QString* p = &QString("Hello");  // 临时对象
+// connect(button, &QPushButton::clicked, [p]() { ... });  // 危险
+```
+
+### 13.2 事件处理相关问题
+
+**Q1: Qt 事件处理顺序是什么？**
+
+```
+1. 事件被发送到 QObject::event()
+2. event() 根据事件类型分发到具体事件处理器
+3. 具体处理器：mousePressEvent、keyPressEvent 等
+4. 如果事件未处理，传递给基类
+5. 事件过滤器在事件到达对象之前拦截
+```
+
+**Q2: 事件过滤器和重写事件函数有什么区别？**
+
+```cpp
+// 重写事件函数：只能处理自己的事件
+void MyWidget::mousePressEvent(QMouseEvent* event) {
+    // 处理自己的鼠标事件
+}
+
+// 事件过滤器：可以监控其他对象的事件
+bool MyWidget::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == lineEdit && event->type() == QEvent::KeyPress) {
+        // 拦截 lineEdit 的键盘事件
+        return true;
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+// 安装过滤器
+lineEdit->installEventFilter(this);
+```
+
+**Q3: 如何发送自定义事件？**
+
+```cpp
+// 定义事件类型
+const QEvent::Type MyEventType = static_cast<QEvent::Type>(QEvent::User + 100);
+
+// 自定义事件类
+class MyEvent : public QEvent {
+public:
+    MyEvent(const QString& data) : QEvent(MyEventType), m_data(data) {}
+    QString data() const { return m_data; }
+private:
+    QString m_data;
+};
+
+// 发送事件
+QApplication::postEvent(receiver, new MyEvent("Hello"));
+
+// 处理事件
+bool Receiver::event(QEvent* e) {
+    if (e->type() == MyEventType) {
+        MyEvent* myEvent = static_cast<MyEvent*>(e);
+        qDebug() << myEvent->data();
+        return true;
+    }
+    return QObject::event(e);
+}
+```
+
+**Q4: accept() 和 ignore() 的区别？**
+
+```cpp
+void MyWidget::closeEvent(QCloseEvent* event) {
+    if (hasUnsavedChanges()) {
+        event->ignore();  // 忽略事件，窗口不关闭
+        askSave();
+    } else {
+        event->accept();  // 接受事件，窗口关闭
+    }
+}
+
+// ignore() 后事件继续传递给父对象
+// accept() 后事件停止传递
+```
+
+### 13.3 内存管理相关问题
+
+**Q1: Qt 对象树机制如何工作？**
+
+```cpp
+// 每个 QObject 可以有父对象
+// 父对象销毁时，自动销毁所有子对象
+
+QWidget* parent = new QWidget();
+QPushButton* button = new QPushButton(parent);
+QLabel* label = new QLabel(parent);
+
+// 只需要删除 parent
+delete parent;  // button 和 label 自动删除
+
+// 注意：不要手动 delete 有父对象的子对象
+```
+
+**Q2: deleteLater() 和 delete 有什么区别？**
+
+```cpp
+// delete：立即删除
+delete object;
+
+// deleteLater：延迟删除
+// 对象在当前事件循环结束后删除
+// 安全：可以在槽函数中调用
+// 槽函数执行完后才真正删除
+object->deleteLater();
+
+// 适用于：
+// 1. 在对象自己的槽函数中删除自己
+// 2. 不确定对象是否还在使用
+connect(socket, &QTcpSocket::disconnected, socket, &QTcpSocket::deleteLater);
+```
+
+**Q3: 如何避免内存泄漏？**
+
+```cpp
+// 1. 使用对象树
+QWidget* parent = new QWidget();
+new QPushButton(parent);  // 自动管理
+
+// 2. 使用智能指针
+QPointer<QPushButton> ptr = new QPushButton();
+// 对象被删除时 ptr 自动置空
+
+// 3. 连接 finished 信号
+QThread* thread = new QThread;
+connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+
+// 4. 检查对象树
+widget->dumpObjectInfo();
+widget->dumpObjectTree();
+```
+
+### 13.4 多线程相关问题
+
+**Q1: QThread::run() 和 moveToThread() 有什么区别？**
+
+```cpp
+// 方式1：继承 QThread，重写 run()
+class MyThread : public QThread {
+    void run() override {
+        // 代码在新线程执行
+        // this->thread() 在新线程
+    }
+};
+
+// 方式2：moveToThread
+class Worker : public QObject {
+    Q_OBJECT
+public slots:
+    void doWork() {
+        // 槽函数在 worker 所在线程执行
+    }
+};
+
+QThread* thread = new QThread;
+Worker* worker = new Worker;
+worker->moveToThread(thread);
+
+// 推荐 moveToThread：
+// - 更灵活
+// - Worker 可以有多个槽函数
+// - 可以控制工作线程
+```
+
+**Q2: 为什么不能在子线程中操作 UI？**
+
+```
+原因：
+1. UI 操作不是线程安全的
+2. UI 事件循环在主线程
+3. GDK/X11/Windows API 都是单线程的
+
+解决方案：
+1. 通过信号槽跨线程通信
+2. 使用 QMetaObject::invokeMethod
+3. 使用 QMetaObject::invokeMethod(..., Qt::QueuedConnection)
+```
+
+```cpp
+// 子线程更新 UI 的正确方式
+class Worker : public QObject {
+    Q_OBJECT
+public slots:
+    void doWork() {
+        // 执行耗时操作
+        QString result = heavyWork();
+
+        // 通过信号更新 UI
+        emit workFinished(result);
+    }
+
+signals:
+    void workFinished(const QString& result);
+};
+
+// 主线程连接信号
+connect(worker, &Worker::workFinished, this, [this](const QString& result) {
+    label->setText(result);  // 在主线程执行
+});
+```
+
+**Q3: 如何正确停止线程？**
+
+```cpp
+class StoppableThread : public QThread {
+public:
+    void stop() {
+        requestInterruption();  // 请求中断
+        quit();                  // 退出事件循环
+        wait();                  // 等待线程结束
+    }
+
+protected:
+    void run() override {
+        while (!isInterruptionRequested()) {
+            // 定期检查中断
+            doWork();
+        }
+    }
+};
+
+// 使用 moveToThread 方式
+class Worker : public QObject {
+    Q_OBJECT
+public:
+    void stop() {
+        QThread::currentThread()->requestInterruption();
+    }
+};
+
+// 停止时
+worker->stop();
+thread->quit();
+thread->wait();
+```
+
+### 13.5 Model/View 架构相关问题
+
+**Q1: 什么时候用 Model/View，什么时候用 Widget 类？**
+
+```
+Widget 类（QListWidget、QTreeWidget、QTableWidget）：
+  - 数据量小（< 1000 项）
+  - 简单的列表/树/表格显示
+  - 快速开发
+
+Model/View（QListView、QTreeView、QTableView + Model）：
+  - 数据量大（> 1000 项）
+  - 复杂的数据结构
+  - 需要自定义显示/编辑
+  - 多个视图共享同一数据
+  - 更好的性能
+```
+
+**Q2: 如何实现自定义 Model？**
+
+```cpp
+// 最少需要重写 5 个函数
+class CustomModel : public QAbstractListModel {
+    Q_OBJECT
+public:
+    // 1. 返回行数
+    int rowCount(const QModelIndex& parent = QModelIndex()) const override {
+        return m_data.size();
+    }
+
+    // 2. 返回数据
+    QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override {
+        if (!index.isValid())
+            return QVariant();
+        return m_data.at(index.row());
+    }
+
+    // 3. 返回表头
+    QVariant headerData(int section, Qt::Orientation orientation, int role) const override {
+        if (role == Qt::DisplayRole)
+            return QString("Column %1").arg(section);
+        return QVariant();
+    }
+
+    // 4. 返回标志
+    Qt::ItemFlags flags(const QModelIndex& index) const override {
+        return QAbstractListModel::flags(index) | Qt::ItemIsEditable;
+    }
+
+    // 5. 设置数据
+    bool setData(const QModelIndex& index, const QVariant& value, int role) override {
+        if (role == Qt::EditRole && index.isValid()) {
+            m_data[index.row()] = value.toString();
+            emit dataChanged(index, index);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    QStringList m_data;
+};
+```
+
+**Q3: Model 的 beginInsertRows 和 endInsertRows 作用？**
+
+```cpp
+// 通知视图数据将要变化/已经变化
+// 必须成对调用
+
+void Model::addItem(const QString& item) {
+    beginInsertRows(QModelIndex(), m_data.size(), m_data.size());
+    m_data.append(item);
+    endInsertRows();  // 视图会自动更新显示新行
+}
+
+void Model::removeItem(int row) {
+    beginRemoveRows(QModelIndex(), row, row);
+    m_data.removeAt(row);
+    endRemoveRows();  // 视图会自动更新
+}
+
+// 批量修改
+void Model::updateAll() {
+    beginResetModel();
+    m_data.clear();
+    // 重新填充数据
+    endResetModel();
+}
+```
+
+### 13.6 编译与构建相关问题
+
+**Q1: moc 是什么？为什么需要它？**
+
+```
+moc（Meta-Object Compiler）是 Qt 的元对象编译器
+
+作用：
+1. 处理 Q_OBJECT 宏
+2. 为信号生成实现代码
+3. 生成 QMetaObject 元对象数据
+4. 处理 Q_PROPERTY、Q_ENUM 等宏
+
+为什么需要：
+- C++ 没有反射机制
+- Qt 需要在运行时获取类信息
+- 信号槽机制需要元对象系统
+
+生成的文件：
+- moc_*.cpp 文件
+- 自动加入编译系统
+```
+
+**Q2: qmake 和 CMake 有什么区别？**
+
+| 特性 | qmake | CMake |
+|------|-------|-------|
+| 语法 | 简单 | 复杂 |
+| Qt 专用 | 是 | 否 |
+| 跨平台 | 是 | 是 |
+| 现代化 | 较老 | 较新 |
+| IDE 支持 | Qt Creator | 广泛 |
+| 社区 | Qt 为主 | 通用 |
+
+**Q3: .pro 文件常用变量？**
+
+```qmake
+TEMPLATE     # 模板类型（app/lib/subdirs）
+TARGET       # 目标文件名
+QT           # Qt 模块（core gui widgets）
+SOURCES      # 源文件
+HEADERS      # 头文件
+FORMS        # UI 文件
+RESOURCES    # 资源文件
+LIBS         # 链接库
+INCLUDEPATH  # 包含路径
+DEFINES      # 预定义宏
+CONFIG       # 编译配置
+```
+
+---
+
+## 十四、调试技巧
+
+### 14.1 qDebug 日志输出
+
+```cpp
+// ========== 基本日志输出 ==========
+
+// qDebug - 调试信息
+qDebug() << "Debug message";
+qDebug() << "Value:" << 42;
+qDebug() << "String:" << QString("Hello");
+
+// qWarning - 警告信息
+qWarning() << "Warning message";
+
+// qCritical - 严重错误
+qCritical() << "Critical error";
+
+// qFatal - 致命错误（会终止程序）
+// qFatal("Fatal error: %s", "something");
+
+// ========== 格式化输出 ==========
+
+int value = 42;
+QString name = "Qt";
+
+// Qt5 风格
+qDebug() << "Value:" << value << "Name:" << name;
+
+// printf 风格（不推荐，类型不安全）
+qDebug("Value: %d, Name: %s", value, name.toLocal8Bit().data());
+
+// ========== 条件输出 ==========
+if (value > 100) {
+    qDebug() << "Value is large:" << value;
+}
+
+// Qt 提供的条件宏
+qDebug() << "This is always shown";
+
+// ========== 日志级别控制 ==========
+
+// 自定义日志函数
+void myLog(QtMsgType type, const QMessageLogContext& context, const QString& msg) {
+    QByteArray localMsg = msg.toLocal8Bit();
+    const char* file = context.file ? context.file : "";
+    const char* function = context.function ? context.function : "";
+
+    switch (type) {
+        case QtDebugMsg:
+            fprintf(stderr, "[DEBUG] %s (%s:%u, %s)\n",
+                    localMsg.constData(), file, context.line, function);
+            break;
+        case QtWarningMsg:
+            fprintf(stderr, "[WARN] %s (%s:%u, %s)\n",
+                    localMsg.constData(), file, context.line, function);
+            break;
+        case QtCriticalMsg:
+            fprintf(stderr, "[ERROR] %s (%s:%u, %s)\n",
+                    localMsg.constData(), file, context.line, function);
+            break;
+        case QtFatalMsg:
+            fprintf(stderr, "[FATAL] %s (%s:%u, %s)\n",
+                    localMsg.constData(), file, context.line, function);
+            abort();
+    }
+}
+
+// 安装日志处理器
+qInstallMessageHandler(myLog);
+
+// ========== 输出到文件 ==========
+
+void logToFile() {
+    QFile file("app.log");
+    if (file.open(QIODevice::Append | QIODevice::Text)) {
+        QTextStream out(&file);
+        out << QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
+            << " - " << "Log message" << "\n";
+    }
+}
+
+// ========== 分类日志 ==========
+// 使用 qCategorizedDebug（Qt5.2+）
+Q_LOGGING_CATEGORY(networkLog, "network")
+Q_LOGGING_CATEGORY(uiLog, "ui")
+
+void myFunction() {
+    qCDebug(networkLog) << "Network operation";
+    qCWarning(uiLog) << "UI warning";
+}
+
+// 运行时设置日志过滤
+// QT_LOGGING_RULES="network.debug=false;ui.debug=true"
+```
+
+### 14.2 dumpObjectInfo / dumpObjectTree
+
+```cpp
+// ========== 对象信息调试 ==========
+
+void debugObjectTree() {
+    QWidget* widget = new QWidget();
+    widget->setObjectName("mainWidget");
+
+    QPushButton* button = new QPushButton(widget);
+    button->setObjectName("okButton");
+
+    QLabel* label = new QLabel(widget);
+    label->setObjectName("statusLabel");
+
+    // ========== dumpObjectInfo ==========
+    // 输出对象信号连接信息
+    widget->dumpObjectInfo();
+
+    /* 输出示例：
+    OBJECT QWidget::mainWidget
+      SIGNALS OUT
+        signal: destroyed(QObject*)
+      SIGNALS IN
+        (none)
+    */
+
+    // ========== dumpObjectTree ==========
+    // 输出对象树结构
+    widget->dumpObjectTree();
+
+    /* 输出示例：
+    QWidget::mainWidget
+        QPushButton::okButton
+        QLabel::statusLabel
+    */
+
+    // ========== 手动遍历对象树 ==========
+    void printObjectTree(QObject* obj, int depth = 0) {
+        qDebug() << QString(depth * 4, ' ')
+                 << obj->metaObject()->className()
+                 << "::" << obj->objectName();
+
+        foreach (QObject* child, obj->children()) {
+            printObjectTree(child, depth + 1);
+        }
+    }
+
+    printObjectTree(widget);
+}
+
+// ========== 查找子对象 ==========
+
+void findChildrenExample() {
+    QWidget* parent = new QWidget();
+
+    QPushButton* button1 = new QPushButton(parent);
+    button1->setObjectName("button1");
+
+    QPushButton* button2 = new QPushButton(parent);
+    button2->setObjectName("button2");
+
+    // 查找指定名称的子对象
+    QPushButton* button = parent->findChild<QPushButton*>("button1");
+    if (button) {
+        qDebug() << "Found button1";
+    }
+
+    // 查找所有 QPushButton
+    QList<QPushButton*> buttons = parent->findChildren<QPushButton*>();
+    qDebug() << "Found" << buttons.size() << "buttons";
+}
+```
+
+### 14.3 Qt Creator 调试器使用
+
+```cpp
+// ========== 断点调试 ==========
+
+void debugExample() {
+    int value = 0;
+
+    // 在这里设置断点：按 F9 或点击行号
+    value = 42;  // <- 断点
+
+    // 条件断点
+    for (int i = 0; i < 100; ++i) {
+        value += i;
+        // 右键断点 -> 设置条件：i == 50
+    }
+
+    // ========== 查看变量 ==========
+    QString text = "Hello";
+    QList<int> numbers = {1, 2, 3};
+
+    // 在调试器中查看：
+    // - 局部变量窗口
+    // - 监视窗口（添加表达式）
+    // - 鼠标悬停变量
+}
+
+// ========== 表达式求值 ==========
+
+void expressionEvaluation() {
+    QString str = "Hello World";
+
+    // 调试器中可以求值：
+    // str.length() -> 11
+    // str.toUpper() -> "HELLO WORLD"
+    // str.split(" ") -> QStringList
+}
+
+// ========== 内存查看 ==========
+
+struct MyStruct {
+    int a;
+    double b;
+    QString c;
+};
+
+void memoryDebug() {
+    MyStruct s = {42, 3.14, "Hello"};
+
+    // 在内存窗口查看：
+    // &s -> 查看内存地址
+    // sizeof(MyStruct) -> 查看大小
+}
+
+// ========== 调试宏 ==========
+
+// 自定义调试宏
+#ifdef QT_DEBUG
+    #define DBG(x) qDebug() << #x << "=" << (x)
+    #define DBG_EXPR(x) qDebug() << #x
+#else
+    #define DBG(x)
+    #define DBG_EXPR(x)
+#endif
+
+void useDebugMacro() {
+    int value = 42;
+    DBG(value);        // 输出: value = 42
+    DBG_EXPR(value);   // 输出: value
+}
+
+// ========== 断言 ==========
+
+void assertionExample() {
+    // Q_ASSERT（仅在 Debug 模式有效）
+    Q_ASSERT(1 + 1 == 2);
+
+    // Q_ASSERT_X（带消息）
+    Q_ASSERT_X(1 + 1 == 2, "math", "one plus one should equal two");
+
+    // Q_VERIFY（总是执行，用于有副作用的检查）
+    bool ok = false;
+    Q_VERIFY(doSomething(&ok));  // doSomething 总是执行
+
+    // 静态断言（编译时检查）
+    static_assert(sizeof(int) == 4, "int must be 4 bytes");
+}
+
+bool doSomething(bool* ok) {
+    *ok = true;
+    return true;
+}
+```
+
+---
+
+## 十五、Qt 特有数据类型与工具类
+
+### 15.1 基本数据类型
+
+```cpp
+// ========== Qt 整数类型（跨平台固定大小）==========
+
+void integerTypes() {
+    // 有符号整数
+    qint8 i8 = -128;             // 8位，-128 ~ 127
+    qint16 i16 = -32768;         // 16位，-32768 ~ 32767
+    qint32 i32 = -2147483648;    // 32位
+    qint64 i64 = -9223372036854775808LL;  // 64位
+
+    // 无符号整数
+    quint8 ui8 = 255;            // 8位，0 ~ 255
+    quint16 ui16 = 65535;        // 16位，0 ~ 65535
+    quint32 ui32 = 4294967295;   // 32位
+    quint64 ui64 = 18446744073709551615ULL;  // 64位
+
+    // 其他类型
+    qlonglong ll = 123456789012LL;
+    qulonglong ull = 123456789012ULL;
+    qreal r = 3.14;              // double（默认）
+    qreal r2 = 3.14f;            // float（某些平台）
+
+    // 指针整数类型（足够存放指针）
+    quintptr ptr = 0;
+    qintptr iptr = 0;
+}
+
+// ========== 类型检查 ==========
+
+void typeChecking() {
+    qDebug() << "sizeof(qint8):" << sizeof(qint8);    // 1
+    qDebug() << "sizeof(qint16):" << sizeof(qint16);  // 2
+    qDebug() << "sizeof(qint32):" << sizeof(qint32);  // 4
+    qDebug() << "sizeof(qint64):" << sizeof(qint64);  // 8
+    qDebug() << "sizeof(quintptr):" << sizeof(quintptr);  // 4或8
+}
+```
+
+### 15.2 字符串处理
+
+```cpp
+// ========== QString ==========
+
+void stringFunctions() {
+    QString str = "Hello World";
+
+    // ========== 大小写转换 ==========
+    QString upper = str.toUpper();      // "HELLO WORLD"
+    QString lower = str.toLower();      // "hello world"
+
+    // ========== 查找 ==========
+    int index = str.indexOf("World");        // 6
+    int lastIndexOf = str.lastIndexOf("l");  // 9
+    bool contains = str.contains("World");   // true
+    bool starts = str.startsWith("Hello");   // true
+    bool ends = str.endsWith("World");       // true
+
+    // ========== 替换 ==========
+    QString replaced = str;
+    replaced.replace("World", "Qt");  // "Hello Qt"
+
+    // 分割
+    QStringList parts = str.split(" ");
+    // ["Hello", "World"]
+
+    // 连接
+    QString joined = parts.join(", ");  // "Hello, World"
+
+    // ========== 截取 ==========
+    QString left = str.left(5);        // "Hello"
+    QString right = str.right(5);      // "World"
+    QString mid = str.mid(6, 5);       // "World"
+
+    // ========== 去空格 ==========
+    QString withSpaces = "  Hello  ";
+    QString trimmed = withSpaces.trimmed();      // "Hello"
+    QString simplified = withSpaces.simplified(); // "Hello"
+
+    // ========== 填充 ==========
+    QString filled = str.leftJustified(20, '-');  // "Hello World---------"
+    QString filled2 = str.rightJustified(20, '-'); // "---------Hello World"
+
+    // ========== 重复 ==========
+    QString repeated = QString("Hi ").repeated(3);  // "Hi Hi Hi "
+}
+
+// ========== QByteArray ==========
+
+void byteFunctions() {
+    // ========== 字节数组 ==========
+    QByteArray bytes = "Hello";
+
+    // 添加数据
+    bytes.append(" World");
+
+    // 大小
+    int size = bytes.size();  // 11
+
+    // 转换为十六进制
+    QByteArray hex = bytes.toHex();  // "48656c6c6f"
+
+    // 从十六进制解析
+    QByteArray fromHex = QByteArray::fromHex("48656c6c6f");
+
+    // Base64 编码/解码
+    QByteArray base64 = bytes.toBase64();
+    QByteArray decoded = QByteArray::fromBase64(base64);
+
+    // ========== 压缩 ==========
+    QByteArray data = "lots of data...";
+    QByteArray compressed = qCompress(data);
+    QByteArray uncompressed = qUncompress(compressed);
+
+    // ========== 数字转换 ==========
+    QByteArray numStr = QByteArray::number(42);       // "42"
+    QByteArray numStr2 = QByteArray::number(3.14);    // "3.14"
+
+    int num = numStr.toInt();           // 42
+    double num2 = numStr2.toDouble();   // 3.14
+}
+
+// ========== QLatin1String ==========
+
+void latinString() {
+    // 避免临时 QString 创建
+    QString str = "Hello";
+
+    // 使用 QLatin1String 比较更高效
+    if (str == QLatin1String("Hello")) {
+        // 不会创建临时 QString
+    }
+
+    // 自定义字面量
+    using namespace QtLiterals;
+    QString str2 = "Hello"_L1;
+}
+```
+
+### 15.3 容器类
+
+```cpp
+// ========== QList ==========
+
+void listFunctions() {
+    QList<int> list;
+
+    // 添加
+    list.append(1);
+    list.prepend(0);
+    list << 2 << 3;  // 链式添加
+
+    // 插入
+    list.insert(2, 99);
+
+    // 访问
+    int first = list.first();
+    int last = list.last();
+    int value = list.at(2);
+
+    // 删除
+    list.removeAt(2);
+    list.removeOne(3);
+    list.removeAll(0);
+
+    // 查找
+    bool contains = list.contains(1);
+    int index = list.indexOf(2);
+
+    // 遍历
+    for (int i = 0; i < list.size(); ++i) {
+        qDebug() << list[i];
+    }
+
+    QListIterator<int> it(list);
+    while (it.hasNext()) {
+        qDebug() << it.next();
+    }
+}
+
+// ========== QMap ==========
+
+void mapFunctions() {
+    QMap<QString, int> map;
+
+    // 插入
+    map["key1"] = 1;
+    map.insert("key2", 2);
+    map.insertMulti("key1", 3);  // 允许重复键
+
+    // 访问
+    int value = map.value("key1", -1);  // 默认值 -1
+
+    // 查找
+    bool contains = map.contains("key1");
+    QList<QString> keys = map.keys();
+    QList<int> values = map.values();
+
+    // 删除
+    map.remove("key1");
+
+    // QMultiMap（允许重复键）
+    QMultiMap<QString, int> multiMap;
+    multiMap.insert("key", 1);
+    multiMap.insert("key", 2);
+    QList<int> valuesForKey = multiMap.values("key");  // [1, 2]
+}
+
+// ========== QHash ==========
+
+void hashFunctions() {
+    QHash<QString, int> hash;
+
+    // 使用方式与 QMap 相同
+    hash["key1"] = 1;
+    hash["key2"] = 2;
+
+    // QHash 特点：
+    // - 查找更快（平均 O(1)）
+    // - 不排序
+    // - 键必须提供 operator==()
+
+    // QMap 特点：
+    // - 查找 O(log n)
+    // - 键排序
+}
+
+// ========== QSet ==========
+
+void setFunctions() {
+    QSet<int> set;
+
+    // 插入
+    set.insert(1);
+    set << 2 << 3 << 1;  // 1 只会存储一次
+
+    // 查找
+    bool contains = set.contains(2);
+
+    // 删除
+    set.remove(1);
+
+    // 集合操作
+    QSet<int> set1 = {1, 2, 3};
+    QSet<int> set2 = {2, 3, 4};
+
+    QSet<int> united = set1.unite(set2);        // {1, 2, 3, 4}
+    QSet<int> intersected = set1.intersect(set2);  // {2, 3}
+}
+```
+
+### 15.4 日期时间
+
+```cpp
+#include <QDateTime>
+#include <QDate>
+#include <QTime>
+
+void dateTimeFunctions() {
+    // ========== 当前时间 ==========
+    QDateTime now = QDateTime::currentDateTime();
+    QDate currentDate = QDate::currentDate();
+    QTime currentTime = QTime::currentTime();
+
+    qDebug() << "Now:" << now;
+    qDebug() << "Date:" << currentDate;
+    qDebug() << "Time:" << currentTime;
+
+    // ========== 格式化输出 ==========
+    QString formatted = now.toString("yyyy-MM-dd hh:mm:ss");
+    // "2024-01-15 14:30:25"
+
+    QString isoFormat = now.toString(Qt::ISODate);
+    // "2024-01-15T14:30:25"
+
+    // ========== 解析字符串 ==========
+    QDateTime parsed = QDateTime::fromString("2024-01-15 14:30:25", "yyyy-MM-dd hh:mm:ss");
+
+    // ========== 日期计算 ==========
+    QDate date = QDate(2024, 1, 15);
+    QDate tomorrow = date.addDays(1);
+    QDate nextMonth = date.addMonths(1);
+    QDate nextYear = date.addYears(1);
+
+    // ========== 时间差 ==========
+    QDateTime dt1 = QDateTime::currentDateTime();
+    QThread::sleep(1);
+    QDateTime dt2 = QDateTime::currentDateTime();
+
+    qint64 msecs = dt1.msecsTo(dt2);  // 毫秒差
+    qint64 secs = dt1.secsTo(dt2);    // 秒差
+    qint64 days = dt1.daysTo(dt2);    // 天差
+
+    // ========== 时间戳 ==========
+    qint64 timestamp = now.toSecsSinceEpoch();  // Unix 时间戳（秒）
+
+    // 从时间戳创建
+    QDateTime fromTimestamp = QDateTime::fromSecsSinceEpoch(timestamp);
+
+    // ========== UTC 时间 ==========
+    QDateTime utc = QDateTime::currentDateTimeUtc();
+    QDateTime local = utc.toLocalTime();
+
+    // ========== 时区 ==========
+    QDateTime timeZone = QDateTime::currentDateTime();
+    timeZone.setTimeZone(QTimeZone("Asia/Shanghai"));
+}
+```
+
+### 15.5 文件与路径
+
+```cpp
+#include <QDir>
+#include <QFileInfo>
+#include <QPath>
+
+void pathFunctions() {
+    // ========== 路径拼接 ==========
+    QString path = QDir::homePath();  // 用户主目录
+    QString filePath = path + "/Documents/file.txt";
+    QString filePath2 = QDir(path).filePath("Documents/file.txt");
+
+    // ========== 目录操作 ==========
+    QDir dir;
+
+    // 创建目录
+    dir.mkpath("parent/child");  // 创建多级目录
+
+    // 判断目录是否存在
+    if (dir.exists("myfolder")) {
+        qDebug() << "Folder exists";
+    }
+
+    // 遍历目录
+    QDir folder("/path/to/folder");
+    QStringList filters;
+    filters << "*.txt" << "*.md";
+    folder.setNameFilters(filters);
+
+    QFileInfoList fileList = folder.entryInfoList(QDir::Files);
+    for (const QFileInfo& fileInfo : fileList) {
+        qDebug() << fileInfo.fileName() << fileInfo.size();
+    }
+
+    // ========== QFileInfo ==========
+    QFileInfo info("/path/to/file.txt");
+
+    qDebug() << "Exists:" << info.exists();
+    qDebug() << "Size:" << info.size();
+    qDebug() << "Created:" << info.birthTime();
+    qDebug() << "Modified:" << info.lastModified();
+    qDebug() << "Readable:" << info.isReadable();
+    qDebug() << "Writable:" << info.isWritable();
+    qDebug() << "Absolute path:" << info.absoluteFilePath();
+    qDebug() << "Base name:" << info.baseName();
+    qDebug() << "Suffix:" << info.suffix();
+    qDebug() << "Complete suffix:" << info.completeSuffix();
+
+    // ========== 路径工具 ==========
+    QString cleanPath = QDir::cleanPath("/path/to/../file.txt");  // "/path/file.txt"
+
+    // ========== 临时文件 ==========
+    QTemporaryFile tempFile;
+    if (tempFile.open()) {
+        qDebug() << "Temp file:" << tempFile.fileName();
+        // 使用后自动删除
+    }
+
+    // 临时目录
+    QTemporaryDir tempDir;
+    if (tempDir.isValid()) {
+        QString tempPath = tempDir.path();
+        // 使用后自动删除
+    }
+
+    // ========== 标准路径 ==========
+    QString home = QDir::homePath();
+    QString root = QDir::rootPath();
+    QString temp = QDir::tempPath();
+    QString current = QDir::currentPath();
+
+    // Qt5.4+ 标准位置
+    QString desktop = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation);
+    QString documents = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    QString appData = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+}
+```
+
+---
+
+## 附录：快速参考
+
+### A.1 常用头文件列表
+
+```cpp
+// ========== 核心 ==========
+#include <QObject>          // 对象基类
+#include <QCoreApplication> // 应用程序类
+#include <QDebug>           // 调试输出
+#include <QTimer>           // 定时器
+#include <QThread>          // 线程
+#include <QMutex>           // 互斥锁
+#include <QFile>            // 文件操作
+
+// ========== GUI ==========
+#include <QWidget>          // 窗口基类
+#include <QPushButton>      // 按钮
+#include <QLabel>           // 标签
+#include <QLineEdit>        // 单行输入
+#include <QTextEdit>        // 多行输入
+#include <QCheckBox>        // 复选框
+#include <QRadioButton>     // 单选框
+#include <QComboBox>        // 下拉框
+#include <QSlider>          // 滑块
+#include <QProgressBar>     // 进度条
+
+// ========== 布局 ==========
+#include <QVBoxLayout>      // 垂直布局
+#include <QHBoxLayout>      // 水平布局
+#include <QGridLayout>      // 网格布局
+#include <QFormLayout>      // 表单布局
+#include <QSplitter>        // 分割器
+
+// ========== 容器控件 ==========
+#include <QListWidget>      // 列表
+#include <QTreeWidget>      // 树形
+#include <QTableWidget>     // 表格
+
+// ========== 高级控件 ==========
+#include <QTabWidget>       // 标签页
+#include <QStackedWidget>   // 堆栈窗口
+#include <QGroupBox>        // 组框
+#include <QScrollArea>      // 滚动区域
+#include <QMainWindow>      // 主窗口
+#include <QDialog>          // 对话框
+#include <QMessageBox>      // 消息框
+#include <QFileDialog>      // 文件对话框
+#include <QInputDialog>     // 输入对话框
+
+// ========== Model/View ==========
+#include <QListView>        // 列表视图
+#include <QTreeView>        // 树形视图
+#include <QTableView>       // 表格视图
+#include <QAbstractListModel>
+#include <QAbstractTableModel>
+#include <QStringListModel>
+
+// ========== 图形 ==========
+#include <QPainter>         // 绘图
+#include <QPainterPath>     // 绘图路径
+#include <QImage>           // 图片
+#include <QPixmap>          // 像素图
+#include <QPicture>         // 图片
+#include <QIcon>            // 图标
+#include <QBrush>           // 画刷
+#include <QPen>             // 画笔
+#include <QColor>           // 颜色
+#include <QFont>            // 字体
+#include <QRegion>          // 区域
+
+// ========== 图形视图框架 ==========
+#include <QGraphicsScene>   // 场景
+#include <QGraphicsView>    // 视图
+#include <QGraphicsItem>    // 图形项
+#include <QGraphicsRectItem>
+#include <QGraphicsEllipseItem>
+#include <QGraphicsPixmapItem>
+
+// ========== 图表 ==========
+#include <QtCharts>         // 图表模块
+#include <QChart>
+#include <QLineSeries>
+#include <QBarSeries>
+#include <QPieSeries>
+
+// ========== 网络 ==========
+#include <QTcpSocket>       // TCP 套接字
+#include <QTcpServer>       // TCP 服务器
+#include <QUdpSocket>       // UDP 套接字
+#include <QNetworkAccessManager>
+#include <QNetworkRequest>
+#include <QNetworkReply>
+
+// ========== 数据 ==========
+#include <QString>          // 字符串
+#include <QStringList>      // 字符串列表
+#include <QByteArray>       // 字节数组
+#include <QVariant>         // 变体
+#include <QVector>          // 向量
+#include <QList>            // 列表
+#include <QMap>             // 映射
+#include <QHash>            // 哈希
+#include <QSet>             // 集合
+#include <QPair>            // 对
+
+// ========== 日期时间 ==========
+#include <QDateTime>        // 日期时间
+#include <QDate>            // 日期
+#include <QTime>            // 时间
+
+// ========== 文件 ==========
+#include <QDir>             // 目录
+#include <QFileInfo>        // 文件信息
+#include <QFile>            // 文件
+#include <QTemporaryFile>   // 临时文件
+#include <QStandardPaths>   // 标准路径
+
+// ========== 设置 ==========
+#include <QSettings>        // 配置文件
+
+// ========== JSON/XML ==========
+#include <QJsonDocument>    // JSON 文档
+#include <QJsonObject>      // JSON 对象
+#include <QJsonArray>       // JSON 数组
+#include <QDomDocument>     // XML 文档
+
+// ========== 资源 ==========
+#include <QResource>        // 资源
+```
+
+### A.2 .pro 文件模板
+
+```qmake
+# ========== 应用程序模板 ==========
+TEMPLATE = app
+TARGET = MyApp
+QT += core gui widgets
+CONFIG += c++17
+
+SOURCES += \
+    main.cpp \
+    mainwindow.cpp
+
+HEADERS += \
+    mainwindow.h
+
+FORMS += \
+    mainwindow.ui
+
+RESOURCES += \
+    resources.qrc
+
+# ========== 库模板 ==========
+TEMPLATE = lib
+TARGET = MyLib
+QT += core gui
+CONFIG += staticlib  # 或 dll
+
+SOURCES += \
+    mylib.cpp
+
+HEADERS += \
+    mylib.h
+
+# ========== 子目录模板 ==========
+TEMPLATE = subdirs
+SUBDIRS = app lib1 lib2
+
+app.depends = lib1 lib2
+```
+
+### A.3 CMakeLists.txt 模板
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(MyApp VERSION 1.0.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
+
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets)
+
+qt_add_executable(MyApp
+    main.cpp
+    mainwindow.cpp
+    mainwindow.h
+    mainwindow.ui
+    resources.qrc
+)
+
+target_link_libraries(MyApp PRIVATE
+    Qt6::Core
+    Qt6::Widgets
+)
+```
+
+### A.4 QSS 常用属性速查
+
+```css
+/* ========== 通用属性 ========== */
+color                    /* 文字颜色 */
+background-color        /* 背景颜色 */
+border                  /* 边框 */
+border-radius          /* 圆角 */
+padding                /* 内边距 */
+margin                 /* 外边距 */
+font                   /* 字体 */
+font-size              /* 字号 */
+font-weight            /* 字重 */
+
+/* ========== 伪状态 ========== */
+:hover                 /* 鼠标悬停 */
+:pressed              /* 按下状态 */
+:focus                /* 焦点状态 */
+:checked              /* 选中状态 */
+:selected             /* 选择状态 */
+:disabled             /* 禁用状态 */
+:enabled              /* 启用状态 */
+:!hover               /* 非悬停 */
+
+/* ========== 子控件 ========== */
+::down-arrow           /* 下拉箭头 */
+::drop-down           /* 下拉区域 */
+::item                /* 列表项 */
+::branch              /* 树形分支 */
+::handle              /* 滑块句柄 */
+::groove              /* 滑块槽 */
+::chunk               /* 进度块 */
+::title               /* 标题 */
+::indicator           /* 指示器 */
+::scroller            /* 滚动条 */
+::section             /* 头部节 */
+```
+
+---
+
+**完**
+
+*本文档涵盖了 Qt 面试的核心知识点，建议结合实际项目经验深入理解。*
+
