@@ -267,102 +267,147 @@ connect(sender, &Sender::testSignal,
 
 #### 信号槽底层实现原理
 
+// 【知识铺垫】Qt 信号槽采用观察者模式，通过 MOC 预处理实现反射机制
+// 【核心概念】emit 不是关键字，只是宏定义的 #define emit
+// 【面试要点】信号槽是线程安全的吗？跨线程如何保证安全？
+
 **完整调用流程**
 
 ```
-emit signal(args)
+【代码层】 emit signal(args)
     ↓
-MOC 生成的信号函数 void ClassName::signal(args)
+【MOC层】 void ClassName::signal(args)  // MOC 生成的函数
     ↓
-QMetaObject::activate(sender, signal_index, args)
+【核心层】 QMetaObject::activate(sender, signal_index, args)
     ↓
-获取 QObjectPrivate::ConnectionVector
+【数据层】 获取 QObjectPrivate::ConnectionVector
     ↓
-遍历该信号的所有 Connection
+【遍历层】 遍历该信号的所有 Connection（链表结构）
     ↓
-根据 Qt::ConnectionType 分发：
-    ├─ DirectConnection:    直接调用槽函数（同栈）
-    ├─ QueuedConnection:    创建 QMetaCallEvent，postEvent
-    ├─ BlockingQueued:      postEvent + QSemaphore::wait()
-    └─ AutoConnection:      判断线程，选 Direct 或 Queued
+【分发层】 根据 Qt::ConnectionType 分发：
+    ├─ DirectConnection:    直接调用槽函数（同栈，同步）
+    ├─ QueuedConnection:    创建 QMetaCallEvent，postEvent（异步）
+    ├─ BlockingQueued:      postEvent + QSemaphore::wait()（阻塞等待）
+    └─ AutoConnection:      判断线程，自动选择 Direct 或 Queued
     ↓
-槽函数执行 (通过 qt_metacall 或直接调用)
+【执行层】 槽函数执行 (通过 qt_metacall 或直接函数指针调用)
 ```
+
+// 【要点总结】
+// 1. emit 只是语法糖，实际调用 MOC 生成的函数
+// 2. 连接存储在 QObjectPrivate 中，使用链表结构
+// 3. 跨线程时会创建 QMetaCallEvent 投递到事件队列
+// 4. ConnectionType 决定调用方式，影响线程安全性
 
 **QObjectPrivate 连接存储结构**
 
 ```cpp
 // qobject_p.h - Qt 内部连接存储机制
+// 【设计模式】使用 Pimpl 模式（私有实现），隐藏实现细节
+
 namespace QObjectPrivate {
 
 // ========== 单个连接结构 ==========
+// 【作用】存储一个信号-槽连接的所有信息
 class Connection {
 public:
-    QObject *receiver;           // 接收者对象指针
-    QObject *sender;             // 发送者对象指针（Qt5.15+）
+    QObject *receiver;           // 接收者对象指针：槽函数所属对象
+    QObject *sender;             // 发送者对象指针（Qt5.15+，用于调试）
 
-    // 槽函数指针（多种形式）
+    // 槽函数指针（多种形式，使用 union 共享内存）
     union {
-        void (**slot)(void **);      // 函数指针数组
-        int method_offset;           // 方法在元对象表中的偏移
-        QStaticSlotResultFunc func;  // 静态函数
+        void (**slot)(void **);      // 函数指针数组：用于 lambda 或函数对象
+        int method_offset;           // 方法在元对象表中的偏移：用于成员函数槽
+        QStaticSlotResultFunc func;  // 静态函数指针
+        // union: 多个成员共享同一块内存，节省空间
     };
 
-    Connection *next;            // 链表下一个节点
-    Connection *prev;            // 链表前一个节点（Qt5 优化）
+    Connection *next;            // 链表下一个节点：实现多个连接
+    Connection *prev;            // 链表前一个节点（Qt5 优化，便于删除）
 
-    // 连接属性（位域节省空间）
-    ushort connectionType : 3;   // Qt::ConnectionType (0-4)
-    ushort isSlotObject : 1;     // 是否是槽对象对象
-    ushort ownArgumentTypes : 1;  // 是否拥有参数类型
-    ushort argumentTypes : 12;   // 参数类型数量
+    // 连接属性（位域技术，16个位被分割使用）
+    ushort connectionType : 3;   // Qt::ConnectionType (0-4): Auto/Direct/Queued/Blocking/Unique
+    ushort isSlotObject : 1;     // 是否是槽对象对象（而非普通成员函数）
+    ushort ownArgumentTypes : 1;  // 是否拥有参数类型（是否需要负责释放）
+    ushort argumentTypes : 12;   // 参数类型数量（最多12个参数）
 
-    int *argumentTypes;          // 参数类型数组（用于类型检查）
+    int *argumentTypes;          // 参数类型数组：用于运行时类型检查（Qt5 新语法）
+
+    // 【位域说明】ushort 16位，分割成 3+1+1+12 = 17位？实际超过会编译失败
+    // Qt 实际上可能使用多个位域或更大的整数
 };
 
 // ========== 连接链表（每个信号一个）==========
+// 【作用】管理某个信号的所有连接（一个信号可连接多个槽）
 class ConnectionList {
 public:
-    Connection *first;           // 链表头节点
-    Connection *last;            // 链表尾节点（优化追加操作）
+    Connection *first;           // 链表头节点：第一个连接
+    Connection *last;            // 链表尾节点：优化追加操作，不需要遍历
 
-    // 并发控制
-    QAtomicInt inUse;           // 使用计数（防止重入问题）
-    QAtomicInt orphaned;        // 孤儿连接计数
+    // 并发控制（原子操作，线程安全）
+    QAtomicInt inUse;           // 使用计数：防止重入问题时多次访问
+    QAtomicInt orphaned;        // 孤儿连接计数：发送者被删除但连接未清理
 };
 
 // ========== 连接向量（所有信号的集合）==========
+// 【作用】管理类的所有信号的连接列表
 class ConnectionVector {
 public:
-    ConnectionList *vector;      // ConnectionList 数组
-    int count;                   // 信号数量
+    ConnectionList *vector;      // ConnectionList 数组：每个信号一个链表
+    int count;                   // 信号数量：数组大小
 
-    // 动态扩容
+    // 动态扩容：当新增信号时自动扩展
     void grow(int signalCount);
 };
+
+// ========== 数据结构图解 ==========
+/*
+ * ConnectionVector (类级别)
+ *   ├─ ConnectionList[0] → Connection → ... → Connection (signal1 的所有连接)
+ *   ├─ ConnectionList[1] → Connection → ... → Connection (signal2 的所有连接)
+ *   └─ ConnectionList[n] → ... (signal n 的所有连接)
+ *
+ * 每个 Connection 包含：
+ *   - 接收者对象
+ *   - 槽函数指针（或方法偏移）
+ *   - 连接类型
+ *   - 下一个连接指针
+ */
 
 } // namespace QObjectPrivate
 
 // ========== QObject::d_ptr 包含连接数据 ==========
+// 【Pimpl 模式】QObject 使用 d_ptr 指向私有数据，保持二进制兼容性
 class QObjectPrivate : public QObjectPrivateData {
 public:
-    ConnectionVector connectionLists;  // 所有信号-槽连接
-    // ... 其他私有数据
+    ConnectionVector connectionLists;  // 所有信号-槽连接的存储
+    // ... 其他私有数据（父对象、子对象列表、线程所属等）
 };
 ```
+
+// 【要点总结】
+// 1. 使用链表存储连接：一个信号可连接多个槽（一对多）
+// 2. 使用 union 节省内存：不同类型槽共享存储空间
+// 3. 位域技术：节省连接属性的存储空间
+// 4. 原子操作：inUse 确保并发访问安全
 
 **MOC 生成的信号函数源码**
 
 ```cpp
 // moc_myclass.cpp - MOC 自动生成的信号实现
+// 【来源】由 myclass.h 经 MOC 处理后生成
 
 // 1. 信号函数实现（emit signal() 展开后就是这个）
+// 【命名规则】void ClassName::signalName(参数)
 void MyClass::dataChanged(int _t1)
 {
-    // _t1 是参数，void** _a 是参数数组
+    // _t1 是参数值（MOC 自动添加下划线前缀避免命名冲突）
+    // void** _a 是通用参数数组：Qt 用数组传递所有参数（包括返回值）
+
     void *_a[] = {
-        nullptr,  // [0] 返回值位置（信号无返回值）
+        nullptr,  // [0] 返回值位置（信号无返回值，设为 nullptr）
         const_cast<void*>(reinterpret_cast<const void*>(&_t1))  // [1] 参数1
+        // [2] 参数2（如果有）...
     };
 
     // 调用 QMetaObject::activate 激活信号
@@ -387,22 +432,28 @@ void MyClass::progressUpdated()
 
 ```cpp
 // qmetaobject.cpp - 信号激活核心函数
+// 【作用】发射信号时调用，遍历所有连接并调用对应槽函数
+// 【面试要点】这是信号槽机制的核心，了解它对理解跨线程调用很重要
+
 void QMetaObject::activate(QObject *sender,
                            const QMetaObject *m,
-                           int local_signal_index,
-                           void **argv)
+                           int local_signal_index,  // 本类中的信号索引
+                           void **argv)             // 参数数组
 {
+    // 计算全局信号索引 = 父类方法数 + 本类信号索引
     int signal_index = m->methodOffset() + local_signal_index;
 
     // ========== 1. 获取连接列表 ==========
+    // QObjectPrivate::get() 获取对象的私有数据（d_ptr）
     QObjectPrivate *senderPriv = QObjectPrivate::get(sender);
     QObjectPrivate::ConnectionVector *connectionVector =
         &senderPriv->connectionLists;
 
-    // 检查是否有该信号的连接
+    // 检查信号索引是否有效（防止越界访问）
     if (signal_index >= connectionVector->count)
-        return;
+        return;  // 没有连接，直接返回
 
+    // 获取该信号对应的连接链表
     QObjectPrivate::ConnectionList *list =
         &connectionVector->vector[signal_index];
 
@@ -410,8 +461,9 @@ void QMetaObject::activate(QObject *sender,
     QObjectPrivate::Connection *c = list->first;
 
     // 标记使用中（防止重入时连接被删除）
+    // 【重入问题】信号触发过程中可能再次触发同一信号
     while (c) {
-        QObjectPrivate::Connection *next = c->next;
+        QObjectPrivate::Connection *next = c->next;  // 先保存下一个，防止 c 被删除
         QObject *receiver = c->receiver;
 
         if (!receiver) {
@@ -422,12 +474,15 @@ void QMetaObject::activate(QObject *sender,
         // ========== 3. 根据连接类型分发 ==========
         switch (c->connectionType) {
             case Qt::AutoConnection:
-                // 自动判断：同线程直接调用，跨线程队列
+                // 【自动连接】Qt 根据线程自动选择同步/异步
+                // 同线程：DirectConnection（直接调用，性能好）
+                // 跨线程：QueuedConnection（队列调用，安全）
                 if (QThread::currentThread() == receiver->thread()) {
-                    // 同线程：直接调用
-                    QObjectPrivate::activate receiver, c, argv);
+                    // 同线程：直接调用（同步）
+                    QObjectPrivate::activate(receiver, c, argv);
                 } else {
-                    // 跨线程：投递事件
+                    // 跨线程：投递事件到接收者线程的事件队列（异步）
+                    // 【线程安全】通过事件队列实现跨线程通信
                     QCoreApplication::postEvent(
                         receiver,
                         new QMetaCallEvent(c, argv)
@@ -436,12 +491,13 @@ void QMetaObject::activate(QObject *sender,
                 break;
 
             case Qt::DirectConnection:
-                // 强制直接调用（可能跨线程，危险）
-                QObjectPrivate::activate receiver, c, argv);
+                // 【直接连接】强制在发送者线程调用（不管接收者在哪个线程）
+                // 【危险】跨线程时会导致槽函数在发送者线程执行，可能不安全
+                QObjectPrivate::activate(receiver, c, argv);
                 break;
 
             case Qt::QueuedConnection:
-                // 强制队列调用
+                // 【队列连接】强制异步调用（总是投递到事件队列）
                 QCoreApplication::postEvent(
                     receiver,
                     new QMetaCallEvent(c, sender, signal_index, argv)
@@ -449,7 +505,8 @@ void QMetaObject::activate(QObject *sender,
                 break;
 
             case Qt::BlockingQueuedConnection:
-                // 阻塞队列：必须跨线程
+                // 【阻塞队列】跨线程时阻塞等待槽函数执行完成
+                // 【注意】只能用于跨线程！同线程会死锁
                 QSemaphore semaphore;
                 QCoreApplication::postEvent(
                     receiver,
@@ -459,32 +516,41 @@ void QMetaObject::activate(QObject *sender,
                 break;
 
             case Qt::UniqueConnection:
-                // 不是真正的连接类型，用于 connect 时检查重复
+                // 【唯一连接】不是真正的连接类型，用于 connect 时检查重复
                 break;
         }
 
-        c = next;
+        c = next;  // 处理下一个连接
     }
 }
+```
 
-// ========== 槽函数调用（内部函数）==========
+// 【要点总结】
+// 1. AutoConnection：同线程同步调用，跨线程异步调用（默认推荐）
+// 2. DirectConnection：总是同步，跨线程不安全
+// 3. QueuedConnection：总是异步，通过事件队列
+// 4. BlockingQueued：跨线程阻塞等待，仅用于特定场景
+// 5. 链表遍历：先保存 next 指针，防止连接被删除后访问无效内存
+
+// ========== 槽函数调用（内部实现）==========
 namespace QObjectPrivate {
-    void activate receiver,
-                       Connection *c,
-                       void **argv)
+    // 【作用】实际调用槽函数的内部函数
+    void activate(QObject *receiver,
+                  Connection *c,
+                  void **argv)  // 参数数组
     {
-        // 方式1：通过方法偏移调用（moc 生成的槽）
+        // 方式1：通过方法偏移调用（moc 生成的成员函数槽）
         if (c->method_offset) {
             QMetaObject::metacall(
                 receiver,
-                QMetaObject::InvokeMetaMethod,
-                c->method_offset - 1,
-                argv
+                QMetaObject::InvokeMetaMethod,  // 调用类型：方法
+                c->method_offset - 1,                // 方法索引（从0开始，-1转换）
+                argv                                 // 参数
             );
         }
-        // 方式2：直接函数指针调用（functor 或 lambda）
+        // 方式2：直接函数指针调用（lambda 或函数对象）
         else if (c->slot) {
-            c->slot(argv);
+            c->slot(argv);  // 函数指针直接调用
         }
     }
 }
@@ -510,7 +576,7 @@ public:
     // 事件被接收者线程处理时调用
     void placeMetaCall(QObject *receiver) {
         // 调用槽函数
-        QObjectPrivate::activate receiver, connection, args);
+        QObjectPrivate::activate(receiver, connection, args);
 
         // 如果是 BlockingQueued，释放信号量
         if (semaphore)
@@ -518,49 +584,79 @@ public:
     }
 
 private:
-    Connection *connection;
-    QObject *sender;
-    int signalId;
-    QSemaphore *semaphore;
-    // ... 参数存储
+    Connection *connection;    // 连接信息：包含接收者、槽函数等
+    QObject *sender;           // 发送者对象：用于识别信号来源
+    int signalId;              // 信号ID：用于调试
+    QSemaphore *semaphore;     // 信号量：用于 BlockingQueued 等待
+    // ... 参数存储：参数被拷贝存储，因为跨线程原参数可能失效
 };
 
-// ========== 跨线程调用流程 ==========
+// 【要点总结】
+// 1. QMetaCallEvent 是跨线程信号槽的载体
+// 2. 参数被序列化存储，避免跨线程访问失效
+// 3. 事件类型为 QEvent::MetaCall，优先级高
+
+// ========== 跨线程调用流程详解 ==========
 /*
- * 线程 A (sender)              线程 B (receiver)
- *     |
- *     | emit signal()
- *     |
- *     v
- * QMetaObject::activate()
- *     |
- *     | 检测到跨线程
- *     |
- *     v
- * QCoreApplication::postEvent() --------> 事件队列
- *                                         |
- *                                         | QMetaCallEvent
- *                                         |
- *                                         v
- *                                    QEventLoop::exec()
- *                                         |
- *                                         | 处理事件
- *                                         |
- *                                         v
- *                                    receiver->event()
- *                                         |
- *                                         | QEvent::MetaCall
- *                                         |
- *                                         v
- *                                    QMetaCallEvent::placeMetaCall()
- *                                         |
- *                                         | 调用槽函数
- *                                         |
- *                                         v
- *                                    qt_metacall()
- *                                         |
- *                                         v
- *                                    实际槽函数执行
+ * 【图解】跨线程信号槽完整流程：
+ *
+ * 线程 A (sender 线程)        线程 B (receiver 线程)
+ * ┌─────────────────┐         ┌─────────────────┐
+ * │  emit signal()  │         │                 │
+ * └────────┬────────┘         └─────────────────┘
+ *          │
+ *          v
+ * ┌─────────────────┐
+ * │ MOC 信号函数     │
+ * │ void signal()   │
+ * └────────┬────────┘
+ *          │
+ *          v
+ * ┌─────────────────┐
+ * │ QMetaObject::    │
+ * │ activate()       │  检测到接收者在其他线程
+ * └────────┬────────┘
+ *          │
+ *          v
+ * ┌─────────────────┐          ┌─────────────────┐
+ * │ QCoreApplication │          │                 │
+ * │ ::postEvent()    │─────────>│ 事件队列         │
+ * │ 创建事件并投递   │          │ (线程间安全传输)  │
+ * └─────────────────┘          └────────┬────────┘
+ *                                        │
+ *                                        v
+ *                                 ┌─────────────────┐
+ *                                 │ 线程 B 的          │
+ *                                 │ QEventLoop::exec()│  处理事件
+ *                                 └────────┬────────┘
+ *                                        │
+ *                                        v
+ *                                 ┌─────────────────┐
+ *                                 │ QApplication::  │  分发事件
+ *                                 │ notify()         │
+ *                                 └────────┬────────┘
+ *                                        │
+ *                                        v
+ *                                 ┌─────────────────┐
+ *                                 │ receiver->       │
+ *                                 │ event(MetaCall)  │
+ *                                 └────────┬────────┘
+ *                                        │
+ *                                        v
+ *                                 ┌─────────────────┐
+ *                                 │ placeMetaCall()  │  调用槽
+ *                                 └────────┬────────┘
+ *                                        │
+ *                                        v
+ *                                 ┌─────────────────┐
+ *                                 │ qt_metacall()    │  分发到具体槽
+ *                                 └────────┬────────┘
+ *                                        │
+ *                                        v
+ *                                 ┌─────────────────┐
+ *                                 │ 实际槽函数        │
+ *                                 │ updateValue()   │  执行业务逻辑
+ *                                 └─────────────────┘
  */
 ```
 
@@ -707,53 +803,124 @@ qDebug() << "Enum string:" << enumStr;  // "Value2"
 
 ```cpp
 // qmetaobject.h - 元对象核心结构
+// 【知识铺垫】QMetaObject 是 Qt 元对象系统的核心，存储类的所有元数据
+// 【设计目标】提供反射能力：运行时获取类信息、调用方法、访问属性
+// 【面试要点】理解 QMetaObject 对理解信号槽机制至关重要
+
 struct QMetaObject {
     // ========== 元数据表（字符串和索引）==========
-    const char *stringdata;      // 字符串数据池
-    const uint *data;            // 索引数据（4字节对齐的整数数组）
+    const char *stringdata;      // 字符串数据池：存储类名、方法名、参数名等所有字符串
+    const uint *data;            // 索引数据：指向整型数组，每个位置含义不同
 
-    // ========== 类继承链 ==========
-    const QMetaObject *superdata; // 父类元对象（链表结构）
+    // ========== 类继承链（支持多态）==========
+    const QMetaObject *superdata; // 父类元对象：指向父类的 QMetaObject，形成链表
+                              // 例如：QWidget::staticMetaObject.superdata → QObject::staticMetaObject
 
-    // ========== 扩展数据 ==========
-    const QMetaObjectPrivate *d;  // 私有数据（Qt5）
+    // ========== 扩展数据（Qt5 新增）==========
+    const QMetaObjectPrivate *d;  // 私有数据：存储更多信息，如信号数量
 
-    // ========== 静态元对象（每个类只有一个）==========
-    static const QMetaObject staticMetaObject;
+    // ========== 静态元对象（每个类只有一个，单例模式）==========
+    static const QMetaObject staticMetaObject;  // MOC 生成的全局唯一实例
 
-    // ========== 核心接口 ==========
-    int methodOffset() const;     // 信号起始索引
-    int propertyOffset() const;   // 属性起始索引
-    int classInfoOffset() const;  // 类信息起始索引
+    // ========== 核心接口函数 ==========
+    int methodOffset() const;     // 信号起始索引：类中第一个信号在 data 数组中的位置
+                               // 例如：如果有 2 个属性，methodOffset = 2，信号从索引 2 开始
+    int propertyOffset() const;   // 属性起始索引：第一个属性的索引
+    int classInfoOffset() const;  // 类信息起始索引：类的额外信息（版本、作者等）
 
-    int methodCount() const;      // 方法总数（信号+槽+其他）
-    int propertyCount() const;
-    int enumeratorCount() const;
+    int methodCount() const;      // 方法总数：信号 + 槽 + 其他方法的总数
+    int propertyCount() const;    // 属性数量：使用 Q_PROPERTY 声明的属性个数
+    int enumeratorCount() const;  // 枚举数量：使用 Q_ENUM 声明的枚举个数
 
-    // 查找接口
-    int indexOfMethod(const char *method) const;
-    int indexOfProperty(const char *name) const;
-    int indexOfEnumerator(const char *name) const;
+    // ========== 查找接口（反射能力）==========
+    int indexOfMethod(const char *method) const;    // 根据方法签名查找索引
+    int indexOfProperty(const char *name) const;    // 查找属性索引
+    int indexOfEnumerator(const char *name) const;  // 查找枚举索引
+
+    // ========== 方法调用接口（动态调用）==========
+    // 【作用】通过索引动态调用方法
+    static bool invokeMethod(QObject *obj, const char *member,
+                              Qt::ConnectionType type,
+                              QGenericReturnArgument ret,
+                              QGenericArgument val0 = QGenericArgument(),
+                              QGenericArgument val1 = QGenericArgument(),
+                              QGenericArgument val2 = QGenericArgument(),
+                              QGenericArgument val3 = QGenericArgument(),
+                              QGenericArgument val4 = QGenericArgument(),
+                              QGenericArgument val5 = QGenericArgument(),
+                              QGenericArgument val6 = QGenericArgument(),
+                              QGenericArgument val7 = QGenericArgument(),
+                              QGenericArgument val8 = QGenericArgument(),
+                              QGenericArgument val9 = QGenericArgument());
+
+    // 【常用接口】
+    const char *className() const;           // 返回类名
+    const char *superClassName() const;     // 返回父类名
+    QMetaMethod method(int index) const;     // 获取指定索引的方法信息
+    QMetaProperty property(int index) const; // 获取指定索引的属性信息
 };
 
-// ========== 元数据布局（data 数组）==========
+// ========== 元数据布局（data 数组详细解析）==========
 /*
- * data 数组是 4 字节整数数组，每个位置含义不同：
+ * data 数组是 4 字节对齐的整数数组，每个位置存储不同的元数据索引
+ * 索引指向 stringdata 中的字符串或存储整型常量
  *
- * [0]  revision (14)          // 版本号
- * [1]  className             // 类名在 stringdata 中的索引
- * [2]  classInfoCount        // 类信息数量
- * [3]  classInfoOffset       // 类信息起始索引
- * [4]  methodCount           // 方法数量
- * [5]  methodOffset          // 方法起始索引
- * [6]  propertyCount         // 属性数量
- * [7]  propertyOffset        // 属性起始索引
- * [8]  enumeratorCount       // 枚举数量
- * [9]  enumeratorOffset      // 枚举起始索引
- * [10] constructorCount      // 构造函数数量
- * [11] constructorOffset     // 构造函数起始索引
- * [12] flags                 // 类标志 (0x01 =_requires_constructor)
- * [13] signalCount           // 信号数量
+ * ================= 头部信息（每个类都有）==================
+ * 索引  |  含义              | 示例值      | 说明
+ * -----------------------------------------------------------------------
+ * [0]   | revision          | 14          | 元对象系统版本号
+ * [1]   | className         | 0           | 类名在 stringdata 中的索引
+ * [2]   | classInfoCount    | 0           | 类信息条目数量
+ * [3]   | classInfoOffset   | 14          | 类信息在 data 数组中的起始索引
+ * [4]   | methodCount       | 5           | 方法数量（信号+槽+其他）
+ * [5]   | methodOffset      | 14          | 方法在 data 数组中的起始索引
+ * [6]   | propertyCount     | 1           | 属性数量
+ * [7]   | propertyOffset    | 19          | 属性在 data 数组中的起始索引
+ * [8]   | enumeratorCount   | 0           | 枚举数量
+ * [9]   | enumeratorOffset  | 20          | 枚举在 data 数组中的起始索引
+ * [10]  | constructorCount   | 0           | 构造函数数量
+ * [11]  | constructorOffset  | 20          | 构造函数在 data 数组中的起始索引
+ * [12]  | flags             | 0x04        | 类标志位
+ *                                        0x04 = RequiresConstructor (Qt5)
+ *
+ * ================= 方法数据（从 methodOffset 开始）==================
+ * 每个方法占用 5 个整数：
+ * 索引  |  含义              | 示例                      | 说明
+ * ------------------------------------------------------------------------------------
+ * [N+0] | name              | 4                         | 方法名在 stringdata 中的索引
+ * [N+1] | signature         | 5                         | 方法签名在 stringdata 中的索引
+ * [N+2] | type              | 6                         | 参数类型在 stringdata 中的索引（逗号分隔）
+ * [N+3] | tag               | 7                         | 相关标签在 stringdata 中的索引
+ * [N+4] | flags             | 0x08                      | 方法标志位
+ *
+ * flags 位域含义：
+ *   - AccessPrivate (0x01)      - 私有方法
+ *   - AccessProtected (0x02)   - 保护方法
+ *   - AccessPublic (0x04)      - 公有方法
+ *   - MethodMethod (0x08)      - 普通方法
+ *   - MethodSignal (0x10)      - 信号
+ *   - MethodSlot (0x20)        - 槽
+ *   - MethodConstructor (0x40) - 构造函数
+ *   - MethodType (0x80)        - 类型
+ *
+ * ================= 数据存储方式图解 ===================
+ * stringdata (字符串池):                    data (索引数组):
+ * ┌────────────────────────┐              ┌──────────────────────┐
+ * │ 0: "MyClass"            │              │ [0]  14 (revision)   │
+ * │ 1: "valueChanged"       │              │ [1]  0 (className)    │ ─┐
+ * │ 2: "valueChanged(int)"  │              │ [2]  0 (classInfoCnt) │  │
+ * │ 3: "int"                │              │ [3]  14 (classInfoOff) │  │
+ * │ 4: "value"              │              │ [4]  5 (methodCount)  │  │
+ * │ 5: "setValue"           │              │ [5]  14 (methodOffset) │ ─┼┐
+ * │ 6: "setValue(int)"      │              │ [6]  1 (propCount)    │  │ │
+ * │ 7: "int"                │              │ [7]  19 (propOffset)   │  │ │
+ * │ ...                     │              │ ...                    │  │ │
+ * └────────────────────────┘              └──────────────────────┘  │ │
+ *                                                  索引指向字符串池 ───────┘ │
+ *                                                           │
+ *                           方法数据从索引 14 开始  ◄────────┘
+ */
+```
  *
  * // 方法数据区（从 methodOffset 开始）
  * [N+0] name                 // 方法名在 stringdata 中的索引
@@ -862,10 +1029,10 @@ int MyClass::qt_metacall(QMetaObject::Call _c, int _id, void **_a)
             // 方法调用
             switch (_id) {
                 case 0: // valueChanged(int)
-                    valueChanged((*reinterpret_cast<int(*)>(_a[1])));
+                    valueChanged((*reinterpret_cast<int*>(_a[1])));
                     break;
                 case 1: // onDataChanged(QString)
-                    onDataChanged((*reinterpret_cast<QString(*)>(_a[1])));
+                    onDataChanged((*reinterpret_cast<QString*>(_a[1])));
                     break;
                 case 2: // reset()
                     reset();
@@ -882,7 +1049,7 @@ int MyClass::qt_metacall(QMetaObject::Call _c, int _id, void **_a)
                     if (_c == QMetaObject::ReadProperty)
                         *_a[0] = QVariant::fromValue(this->value());
                     else
-                        this->setValue((*reinterpret_cast<int(*)>(_a[1])));
+                        this->setValue((*reinterpret_cast<int*>(_a[1])));
                     break;
                 default: ;
             }
@@ -918,8 +1085,8 @@ void MyClass::qt_static_metacall(QObject *_o, QMetaObject::Call _c,
     if (_c == QMetaObject::InvokeMetaMethod) {
         MyClass *_t = static_cast<MyClass *>(_o);
         switch (_id) {
-            case 0: _t->valueChanged((*reinterpret_cast<int(*)>(_a[1]))); break;
-            case 1: _t->onDataChanged((*reinterpret_cast<QString(*)>(_a[1]))); break;
+            case 0: _t->valueChanged((*reinterpret_cast<int*>(_a[1]))); break;
+            case 1: _t->onDataChanged((*reinterpret_cast<QString*>(_a[1]))); break;
             case 2: _t->reset(); break;
             default: ;
         }
@@ -1998,7 +2165,7 @@ private:
 class WindowsPlatformWidget : public QWidget {
 public:
     // ========== 设置窗口透明度（Windows API）==========
-    void setWindowOpacity qreal opacity) {
+    void setWindowOpacity(qreal opacity) {
         // Windows 2000+
         HWND hwnd = (HWND)winId();
         LONG_PTR style = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
@@ -2055,61 +2222,210 @@ public:
  * 3. 子对象在父对象的 children() 列表中
  */
 
-void exampleObjectTree() {
-    // 创建父对象
+// ========== 会被自动删除的情况 ==========
+/*
+ * 1. 通过构造函数指定父对象：new QObject(parent)
+ * 2. 通过 setParent() 设置父对象：obj->setParent(parent)
+ * 3. 添加到 QWidget 的布局中：layout->addWidget(widget)
+ * 4. QObject 派生类对象在对象树中时，父对象析构会自动删除子对象
+ */
+
+void exampleAutoDelete() {
     QWidget* window = new QWidget();
 
-    // 创建子对象时指定父对象
+    // 情况1：构造时指定父对象
     QPushButton* button1 = new QPushButton("Button 1", window);
-    QPushButton* button2 = new QPushButton(window);
-    button2->setParent(window);  // 或稍后设置父对象
+    // button1 会被 window 自动删除
 
-    QLabel* label = new QLabel("Label", window);
+    // 情况2：后设置父对象
+    QPushButton* button2 = new QPushButton();
+    button2->setParent(window);
+    // button2 会被 window 自动删除
 
-    // 布局也会被父对象管理
+    // 情况3：通过布局添加（widget 会被重父对象设置为 window）
     QVBoxLayout* layout = new QVBoxLayout(window);
-    layout->addWidget(button1);
-    layout->addWidget(button2);
-    layout->addWidget(label);
+    QLabel* label = new QLabel();
+    layout->addWidget(label);  // label 的父对象自动设为 window
+    // label 会被 window 自动删除
 
-    // 只需要删除顶层对象
-    delete window;  // button1, button2, label, layout 都会自动删除
+    delete window;  // button1, button2, label, layout 全部自动删除
+}
 
-    // ========== 对象树遍历 ==========
+// ========== 不会被自动删除的情况 ==========
+/*
+ * 1. 栈上创建的对象（非指针）
+ * 2. 创建时未指定父对象，且后续未设置父对象
+ * 3. 使用 deleteLater() 但事件循环未运行时对象未被实际删除
+ * 4. 对象被从对象树中移除（setParent(nullptr) 或移除自身）
+ * 5. 非 QObject 派生类的对象
+ */
+
+void exampleNoAutoDelete() {
+    QWidget* window = new QWidget();
+
+    // 情况1：栈对象，超出作用域自动销毁（与对象树无关）
+    QPushButton stackButton;  // 栈上对象
+    // stackButton 超出作用域时自动析构，与 window 无关
+
+    // 情况2：未设置父对象，需要手动管理
+    QPushButton* orphan = new QPushButton();  // 无父对象
+    // orphan 不会被 window 删除，需要手动 delete orphan;
+
+    // 情况3：设置父对象为 nullptr，从对象树中移除
+    QPushButton* child = new QPushButton(window);
+    child->setParent(nullptr);  // 从对象树移除
+    // child 不再被 window 管理，需要手动 delete child;
+
+    delete window;
+    delete orphan;    // 必须手动删除
+    delete child;     // 必须手动删除
+}
+
+// ========== 特殊情况详解 ==========
+
+// 1. 重复删除问题（Double Delete）
+class DoubleDeleteExample : public QWidget {
+public:
+    DoubleDeleteExample() {
+        // 错误做法：手动删除有父对象的子对象
+        QPushButton* btn = new QPushButton(this);
+        delete btn;  // ❌ 危险！父对象析构时会再次尝试删除，导致崩溃
+    }
+};
+
+// 2. 父子类型不匹配
+void typeMismatchExample() {
+    // 父对象必须是 QObject 派生类
+    QObject* parent = new QObject();
+    QWidget* child = new QWidget(parent);  // ✅ 可以，QWidget 继承自 QObject
+
+    // 子对象析构顺序：先子后父
+    // 析构时，会先调用所有子对象的析构函数，再析构父对象
+}
+
+// 3. 对象所有权转移
+void ownershipTransfer() {
+    QPushButton* button = new QPushButton();
+    QWidget* window1 = new QWidget();
+    QWidget* window2 = new QWidget();
+
+    button->setParent(window1);  // window1 拥有 button
+    button->setParent(window2);  // 所有权转移到 window2，window1 不再拥有
+
+    delete window1;  // button 不会被删除
+    delete window2;  // button 会被删除
+}
+
+// 4. deleteLater() 的特殊行为
+void deleteLaterExample() {
+    QPushButton* button = new QPushButton();
+    button->deleteLater();  // 不会立即删除，而是发送 DeferredDelete 事件
+    // 在下一个事件循环中真正删除
+
+    // 在事件循环运行前
+    qDebug() << button->isNull();  // false，对象仍然存在
+
+    // 事件循环运行后，对象才会真正被删除
+    // 这使得在事件处理中安全地删除发送者
+    // 例如：on_buttonClicked() { sender()->deleteLater(); }
+}
+
+// ========== 对象树遍历 ==========
+void traverseObjectTree() {
+    QWidget* window = new QWidget();
+    new QPushButton("Button1", window);
+    new QPushButton("Button2", window);
+    new QLabel("Label", window);
+
+    // 获取直接子对象数量
     qDebug() << "Children count:" << window->children().count();
 
+    // 遍历所有子对象
     foreach (QObject* child, window->children()) {
         qDebug() << "Child:" << child->metaObject()->className();
     }
 
-    // 查找子对象
+    // 查找特定类型的子对象
     QPushButton* btn = window->findChild<QPushButton*>();
     QList<QPushButton*> buttons = window->findChildren<QPushButton*>();
+
+    // 递归查找（包括子对象的子对象）
+    QList<QWidget*> allWidgets = window->findChildren<QWidget*>(Qt::FindDirectChildrenOnly);
+    QList<QWidget*> recursiveWidgets = window->findChildren<QWidget*>();
 }
 
-// ========== 注意事项 ==========
-class BadExample :public QObject {
+// ========== 内存管理最佳实践 ==========
+
+class BestPractices : public QWidget {
+    Q_OBJECT
 public:
-    BadExample() {
-        // 错误：删除了有父对象的子对象
-        QPushButton* btn = new QPushButton(this);
-        delete btn;  // 危险！父对象销毁时会再次删除
+    BestPractices(QWidget* parent = nullptr) : QWidget(parent) {
+        // ✅ 方式1：构造时指定父对象（推荐用于UI组件）
+        m_button = new QPushButton("Click", this);
+
+        // ✅ 方式2：使用成员变量初始化
+        m_label = new QLabel("Label", this);
+
+        // ✅ 方式3：临时对象使用 QScopedPointer（无需父对象）
+        QScopedPointer<QTimer> timer(new QTimer());
+        timer->start(1000);
+        // timer 超出作用域自动删除
+
+        // ✅ 方式4：跨作用域使用 QPointer（守护指针）
+        m_weakButton = QPointer<QPushButton>(new QPushButton());
     }
+
+    ~BestPractices() {
+        // 不需要手动删除 m_button 和 m_label
+        // 父对象 this 析构时会自动删除它们
+    }
+
+    // ✅ 对于需要在父对象析构前移除的情况
+    void removeChildManually() {
+        if (m_label) {
+            m_label->setParent(nullptr);  // 从对象树移除
+            delete m_label;               // 手动删除
+            m_label = nullptr;
+        }
+    }
+
+private:
+    QPushButton* m_button;      // 由父对象管理
+    QLabel* m_label;            // 由父对象管理
+    QPointer<QPushButton> m_weakButton;  // 守护指针
 };
 
-class GoodExample :public QObject {
-public:
-    GoodExample() {
-        // 方案1：不设置父对象，手动管理
-        QPushButton* btn = new QPushButton();
-        // 使用后手动 delete
+// ========== 禁止复制QObject ==========
+/*
+ * QObject 及其派生类禁止复制（拷贝构造和赋值运算符被删除）
+ * 这是为了避免对象树混乱和重复删除
+ */
+void noCopyExample() {
+    QWidget widget1;
+    QWidget widget2;
 
-        // 方案2：设置父对象，由父对象管理
-        QPushButton* btn2 = new QPushButton(this);
-        // 不需要手动删除
-    }
-};
+    // 以下操作编译错误：
+    // QWidget widget3 = widget1;  // ❌ 拷贝构造被删除
+    // widget2 = widget1;           // ❌ 赋值运算符被删除
+
+    // 正确做法：使用指针
+    QWidget* widget3 = &widget1;  // ✅ 指针复制没问题
+    widget3 = &widget2;           // ✅ 指针重指向没问题
+}
 ```
+
+**对象树删除规则总结表：**
+
+| 情况 | 是否自动删除 | 说明 |
+|------|-------------|------|
+| `new QObject(parent)` | ✅ 是 | 构造时指定父对象 |
+| `obj->setParent(parent)` | ✅ 是 | 设置父对象后 |
+| `layout->addWidget(widget)` | ✅ 是 | widget 自动重父对象为 layout 的父窗口 |
+| 栈对象 `QWidget w;` | ❌ 否 | 栈对象，作用域结束时自动析构 |
+| `new QObject()` 无父 | ❌ 否 | 孤儿对象，需手动 delete |
+| `obj->setParent(nullptr)` | ❌ 否 | 从对象树移除，需手动管理 |
+| `deleteLater()` | ⏳ 延迟 | 事件循环中延迟删除 |
+| 非 QObject 派生类 | ❌ 否 | 不在对象树管理范围内 |
 
 ### 3.2 智能指针
 
@@ -2263,13 +2579,134 @@ private:
 
 ### 4.1 QListWidget / QListView（列表控件）
 
+// 【使用场景】
+// - QListWidget: 少量数据（< 1000 项），快速开发，项可以包含图标和复选框
+// - QListView + Model: 大量数据（> 1000 项），高性能，需要自定义显示
+// 【面试要点】何时用 Widget vs Model/View？
+
 ```cpp
 // ========== QListWidget（便捷方式，小数据量）==========
+// 【特点】所有功能封装好的类，使用简单
+// 【优点】快速开发，内置编辑、拖拽、选择功能
+// 【缺点】数据量大时性能差，不够灵活
 
 QListWidget* listWidget = new QListWidget(this);
 
 // 添加项目
-listWidget->addItem("Item 1");
+listWidget->addItem("Item 1");  // 添加纯文本项
+listWidget->addItem("Item 2");
+listWidget->addItem("Item 3");
+
+// 使用自定义项目
+QListWidgetItem* item = new QListWidgetItem();  // 创建列表项
+item->setText("Custom Item");                        // 设置文本
+item->setIcon(QIcon(":/icons/item.png"));           // 设置图标
+item->setToolTip("This is a tooltip");           // 设置提示
+item->setFlags(item->flags() | Qt::ItemIsEditable);  // 设置可编辑
+listWidget->addItem(item);
+
+// ========== 常用设置 ==========
+// 设置选择模式
+listWidget->setSelectionMode(QAbstractItemView::SingleSelection);     // 单选
+// listWidget->setSelectionMode(QAbstractItemView::MultiSelection);        // 多选
+// listWidget->setSelectionMode(QAbstractItemView::ExtendedSelection);  // 扩展选择（Shift+点击）
+
+// 设置选择行为
+listWidget->setSelectionBehavior(QAbstractItemView::SelectItems);   // 选中项
+listWidget->setSelectionBehavior(QAbstractItemView::SelectRows);    // 选中行
+
+// 设置编辑触发器
+listWidget->setEditTriggers(QAbstractItemView::DoubleClicked |     // 双击编辑
+                              QAbstractItemView::EditKeyPressed);  // 按F2编辑
+
+// 拖拽支持
+listWidget->setDragEnabled(true);             // 允许拖动项
+listWidget->setAcceptDrops(true);            // 允许放置项
+listWidget->setDropIndicatorShown(true);     // 显示拖动指示器
+
+// ========== 信号与槽 ==========
+connect(listWidget, &QListWidget::itemClicked, [](QListWidgetItem* item) {
+    qDebug() << "Clicked:" << item->text();
+});
+
+connect(listWidget, &QListWidget::itemDoubleClicked, [](QListWidgetItem* item) {
+    qDebug() << "Double clicked:" << item->text();
+    item->setFlags(item->flags() | Qt::ItemIsEditable);  // 双击后可编辑
+});
+
+connect(listWidget, &QListWidget::currentRowChanged, [](int currentRow) {
+    qDebug() << "Current row:" << currentRow;
+});
+
+connect(listWidget, &QListWidget::itemChanged, [](QListWidgetItem* item, int column) {
+    qDebug() << "Changed:" << item->text(column);
+});
+
+// ========== 数据操作 ==========
+// 遍历所有项目
+for (int i = 0; i < listWidget->count(); ++i) {
+    QListWidgetItem* item = listWidget->item(i);
+    qDebug() << item->text();
+}
+
+// 获取选中项目
+QList<QListWidgetItem*> selected = listWidget->selectedItems();
+for (QListWidgetItem* item : selected) {
+    qDebug() << "Selected:" << item->text();
+}
+
+// 删除选中项目
+qDeleteAll(listWidget->selectedItems());
+
+// 清空列表
+listWidget->clear();
+
+// 当前项操作
+QListWidgetItem* current = listWidget->currentItem();
+if (current) {
+    qDebug() << "Current:" << current->text();
+    // 设置文本、图标等
+    current->setText("Modified");
+    current->setIcon(QIcon(":/icons/modified.png"));
+}
+
+// 在单元格中插入控件
+QComboBox* combo = new QComboBox();
+combo->addItem("Option 1");
+combo->addItem("Option 2");
+listWidget->setItemWidget(row, 1, combo);  // 在(row, column)位置插入
+```
+
+```cpp
+// ========== QListView + Model（MVC模式，大数据量）==========
+// 【特点】数据与界面分离，适合大量数据和自定义显示
+// 【优点】性能好，灵活，多个视图共享同一数据
+// 【缺点】代码量多，需要理解 Model/View 架构
+
+QListView* listView = new QListView(this);
+QStringListModel* model = new QStringListModel(this);
+
+QStringList data;
+data << "Apple" << "Banana" << "Cherry";
+model->setStringList(data);
+
+listView->setModel(model);
+
+// 动态添加数据
+int row = model->rowCount();
+model->insertRows(row, 1);
+QModelIndex index = model->index(row);
+model->setData(index, "Elderberry");
+
+// 删除数据
+model->removeRows(0, 1);  // 删除第一行
+
+
+// 【要点总结】
+// 1. QListWidget 适合简单场景，快速开发
+// 2. QListView + Model 适合复杂数据和大数据量
+// 3. 使用 setItemWidget 可以在列表项中嵌入控件
+// 4. currentRowChanged 信号比 itemClicked 更适合处理当前行变化
 listWidget->addItem("Item 2");
 listWidget->addItem("Item 3");
 
@@ -2367,73 +2804,110 @@ for (int i = 0; i < 10; ++i) {
 listView2->setModel(standardModel);
 
 // 3. 自定义 Model（推荐用于复杂数据）
+// 【为什么要自定义 Model】
+// - QListWidget 的数据存储和显示耦合，不便于管理复杂数据
+// - 自定义 Model 实现 Model/View 分离，同一数据可用于多个视图
+// - 更好的性能，大数据量时只加载可见项
+// - 支持自定义排序、过滤、修改操作
+
 class CustomListModel : public QAbstractListModel {
     Q_OBJECT
 public:
+    // 【数据结构】定义 Model 管理的数据类型
+    // 可以根据实际需求设计，这里以联系人信息为例
     struct Contact {
-        QString name;
-        QString phone;
-        QString email;
+        QString name;    // 姓名
+        QString phone;   // 电话
+        QString email;   // 邮箱
     };
 
+    // 【构造函数】
+    // parent: 父对象，用于内存管理（对象树）
     explicit CustomListModel(QObject* parent = nullptr)
         : QAbstractListModel(parent) {
-        // 初始化数据
+        // 初始化数据（实际应用中可能从数据库或文件加载）
         m_contacts.append({"张三", "13800138000", "zhangsan@qq.com"});
         m_contacts.append({"李四", "13900139000", "lisi@qq.com"});
         m_contacts.append({"王五", "13700137000", "wangwu@qq.com"});
     }
 
+    // 【自定义角色】enum Roles
+    // Qt::UserRole 是 Qt 预定义的用户角色起始值
+    // 自定义角色应该从 Qt::UserRole + 1 开始，避免冲突
     enum Roles {
-        NameRole = Qt::UserRole + 1,
-        PhoneRole,
-        EmailRole
+        NameRole = Qt::UserRole + 1,  // 姓名角色
+        PhoneRole,                    // 电话角色（自动递增为 Qt::UserRole + 2）
+        EmailRole                     // 邮箱角色（自动递增为 Qt::UserRole + 3）
     };
 
+    // 【rowCount()】必须重写，返回行数
+    // parent: 父索引（List Model 通常忽略）
+    // 返回值：列表中的数据项数量
     int rowCount(const QModelIndex& parent = QModelIndex()) const override {
-        Q_UNUSED(parent)
+        Q_UNUSED(parent)  // 宏：声明参数未使用，避免编译警告
         return m_contacts.size();
     }
 
+    // 【data()】必须重写，返回指定索引和角色的数据
+    // index: 数据索引（包含行、列信息）
+    // role: 数据角色（DisplayRole, EditRole, 或自定义角色）
+    // 返回值：对应的数据，无效则返回 QVariant()
     QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override {
+        // 【有效性检查】确保索引有效且在范围内
         if (!index.isValid() || index.row() >= m_contacts.size())
             return QVariant();
 
+        // 获取对应行的数据
         const Contact& contact = m_contacts.at(index.row());
 
+        // 【角色分发】根据角色返回不同的数据
         switch (role) {
-            case Qt::DisplayRole:
+            case Qt::DisplayRole:      // 默认显示角色（用于普通显示）
                 return contact.name;
-            case NameRole:
+            case NameRole:             // 自定义角色：姓名
                 return contact.name;
-            case PhoneRole:
+            case PhoneRole:            // 自定义角色：电话
                 return contact.phone;
-            case EmailRole:
+            case EmailRole:            // 自定义角色：邮箱
                 return contact.email;
             default:
-                return QVariant();
+                return QVariant();     // 未知角色返回空值
         }
     }
 
-    // 添加数据
+    // 【添加数据】addContact()
+    // 注意：修改 Model 数据时必须通知视图更新
     void addContact(const Contact& contact) {
+        // beginInsertRows(): 通知视图将要插入行
+        // 参数：父索引，起始行，结束行
         beginInsertRows(QModelIndex(), m_contacts.size(), m_contacts.size());
+
+        // 执行插入操作
         m_contacts.append(contact);
+
+        // endInsertRows(): 通知视图插入完成，触发视图刷新
         endInsertRows();
     }
 
-    // 删除数据
+    // 【删除数据】removeContact()
     void removeContact(int row) {
+        // 边界检查
         if (row < 0 || row >= m_contacts.size())
             return;
 
+        // beginRemoveRows(): 通知视图将要删除行
         beginRemoveRows(QModelIndex(), row, row);
+
+        // 执行删除操作
         m_contacts.removeAt(row);
+
+        // endRemoveRows(): 通知视图删除完成
         endRemoveRows();
     }
 
 private:
-    QList<Contact> m_contacts;
+    // 【数据存储】Model 内部数据容器
+    QList<Contact> m_contacts;  // 使用 QList 存储联系人列表
 };
 
 // 使用自定义 Model
@@ -2442,23 +2916,34 @@ QListView* listView3 = new QListView(this);
 listView3->setModel(customModel);
 
 // 自定义委托
+// 【什么是委托（Delegate）】
+// - 委托负责为 View 绘制和编辑数据项
+// - QStyledItemDelegate 是 Qt 提供的样式感知委托基类
+// - 自定义委托可以实现复杂的显示效果（如多行文本、图标+文字等）
 class ContactDelegate : public QStyledItemDelegate {
     Q_OBJECT
 public:
+    // 【paint()】绘制函数
+    // 负责在视图中绘制数据项的外观
     void paint(QPainter* painter, const QStyleOptionViewItem& option,
                const QModelIndex& index) const override {
-        // 自定义绘制
-        QRect rect = option.rect;
+        // 【绘制步骤】
 
-        // 绘制背景
+        // 1. 获取绘制区域
+        QRect rect = option.rect;  // 当前项的矩形区域
+
+        // 2. 绘制背景（选中状态）
+        // option.state: 项的状态标志（选中、悬停、焦点等）
         if (option.state & QStyle::State_Selected) {
-            painter->fillRect(rect, option.palette.highlight());
+            painter->fillRect(rect, option.palette.highlight());  // 高亮色填充
         }
 
-        // 绘制文字
+        // 3. 获取数据
+        // index.data(role): 根据 DataRole 获取数据
         QString name = index.data(CustomListModel::NameRole).toString();
         QString phone = index.data(CustomListModel::PhoneRole).toString();
 
+        // 4. 绘制文字
         painter->setPen(option.palette.text().color());
         painter->drawText(rect.adjusted(5, 5, -5, -5), Qt::AlignLeft | Qt::AlignTop, name);
         painter->drawText(rect.adjusted(5, 25, -5, -5), Qt::AlignLeft | Qt::AlignTop, phone);
@@ -2472,18 +2957,46 @@ public:
     }
 };
 
+// 【使用自定义委托】
+// setItemDelegate(): 为视图设置委托
 listView3->setItemDelegate(new ContactDelegate(this));
+
+// 【要点总结】
+// 1. 自定义 Model 需要继承 QAbstractListModel/QAbstractTableModel
+// 2. 必须重写 rowCount() 和 data() 函数
+// 3. 修改数据时必须调用 begin*Rows()/end*Rows() 通知视图
+// 4. 自定义角色从 Qt::UserRole + 1 开始定义
+// 5. 委托负责绘制和编辑，可以实现复杂的显示效果
 ```
 
 ### 4.2 QTreeWidget / QTreeView（树形控件）
 
+// 【使用场景】
+// - QTreeWidget: 中小数据量（< 5000 节点），快速开发，文件树、组织结构图
+// - QTreeView + Model: 大数据量（> 5000 节点），文件系统浏览、复杂层级数据
+// 【面试要点】何时用 Widget vs Model/View？如何实现三态复选框？
+
 ```cpp
 // ========== QTreeWidget（便捷方式）==========
+// 【特点】封装好的树形控件，操作简单
+// 【优点】快速开发，内置编辑、拖拽、展开/折叠功能
+// 【缺点】数据量大时性能差，内存占用高
 
+// 创建树控件并设置表头
 QTreeWidget* treeWidget = new QTreeWidget(this);
+// setHeaderLabels: 设置每一列的标题，参数是字符串列表
 treeWidget->setHeaderLabels(QStringList() << "名称" << "类型" << "大小");
+//                     列0      列1        列2
 
-// 添加顶层节点
+// 隐藏表头（可选）
+// treeWidget->setHeaderHidden(true);
+
+// ========== 添加节点 ==========
+// 【父子关系】创建节点时指定父项，自动建立层级关系
+// 【内存管理】父项删除时，所有子项自动删除
+
+// 添加顶层节点（根节点）
+// 参数 treeWidget 表示这是一个顶层节点
 QTreeWidgetItem* rootItem = new QTreeWidgetItem(treeWidget);
 rootItem->setText(0, "根目录");
 rootItem->setIcon(0, QIcon(":/icons/folder.png"));
@@ -2766,23 +3279,39 @@ private:
 
 ### 4.3 QTableWidget / QTableView（表格控件）
 
+// 【使用场景】
+// - QTableWidget: 中小数据量（< 10000 行），快速开发，数据表格、设置界面
+// - QTableView + Model: 大数据量（> 10000 行），数据库显示、报表系统
+// 【面试要点】如何实现单元格合并？如何排序？如何自定义绘制？
+
 ```cpp
 // ========== QTableWidget（便捷方式）==========
+// 【特点】封装好的表格控件，类似 Excel
+// 【优点】使用简单，内置编辑、选择、排序功能
+// 【缺点】大数据量性能差，内存占用高
 
+// 创建表格控件
 QTableWidget* tableWidget = new QTableWidget(this);
 
-// 设置行列数
-tableWidget->setRowCount(10);
-tableWidget->setColumnCount(5);
+// ========== 设置表格尺寸 ==========
+// setRowCount: 设置行数，可动态增减
+tableWidget->setRowCount(10);     // 初始10行
+// setColumnCount: 设置列数，通常固定
+tableWidget->setColumnCount(5);   // 5列
 
-// 设置表头
+// ========== 设置表头 ==========
+// setHorizontalHeaderLabels: 设置水平表头（列标题）
+// 参数：字符串列表，每个元素对应一列
 tableWidget->setHorizontalHeaderLabels(
     QStringList() << "ID" << "姓名" << "年龄" << "部门" << "薪资"
+//               列0    列1      列2      列3      列4
 );
 
-// 设置表头字体
+// ========== 表头样式设置 ==========
+// horizontalHeader(): 获取水平表头对象
+// QFont: 字体设置类
 QFont headerFont = tableWidget->horizontalHeader()->font();
-headerFont.setBold(true);
+headerFont.setBold(true);         // 设置粗体
 tableWidget->horizontalHeader()->setFont(headerFont);
 
 // 设置单元格内容
@@ -3085,35 +3614,55 @@ tableView->setItemDelegateForColumn(2, new SpinBoxDelegate(this));  // 年龄列
 
 ### 4.4 QChart（图表控件）
 
+// 【使用场景】
+// - 折线图: 显示趋势变化（股票走势、温度变化、销售趋势）
+// - 柱状图: 比较数据大小（销售额对比、成绩统计、资源使用）
+// - 饼图: 显示占比关系（市场份额、磁盘使用、人口分布）
+// - 散点图: 显示数据分布（相关性分析、抽样数据）
+// - 面积图: 显示累积趋势（流量统计、降雨量）
+
 **需要添加模块: `QT += charts`**
 
 ```cpp
 // ========== 基础设置 ==========
 #include <QtCharts>
 
+// QT_CHARTS_USE_NAMESPACE: 使用 QtCharts 命名空间，避免前缀 QtCharts::
 QT_CHARTS_USE_NAMESPACE
 
-// 创建图表视图
+// ========== 创建图表视图 ==========
+// QChartView: 显示图表的控件（继承自 QGraphicsView）
+// QChart: 图表数据容器
 QChartView* chartView = new QChartView(this);
 QChart* chart = new QChart();
-chart->setTitle("数据统计分析");
+chart->setTitle("数据统计分析");                    // 设置图表标题
+// setAnimationOptions: 设置动画效果
+//   - NoAnimation: 无动画
+//   - GridAxisAnimations: 坐标轴动画
+//   - SeriesAnimations: 系列动画（推荐）
+//   - AllAnimations: 全部动画
 chart->setAnimationOptions(QChart::SeriesAnimations);
 chartView->setChart(chart);
 
-// ========== 1. 折线图 ==========
+// ========== 1. 折线图（QLineSeries）==========
+// 【应用场景】趋势分析、时间序列数据
+// 【特点】显示数据随时间/类别变化的趋势
 
+// QLineSeries: 折线系列，继承自 QXYSeries
 QLineSeries* lineSeries = new QLineSeries();
-lineSeries->setName("2024年销售额");
+lineSeries->setName("2024年销售额");  // 图例显示的名称
 
-// 添加数据点
-lineSeries->append(0, 15);
-lineSeries->append(1, 28);
-lineSeries->append(2, 35);
-lineSeries->append(3, 42);
-lineSeries->append(4, 58);
-lineSeries->append(5, 65);
-lineSeries->append(6, 72);
-lineSeries->append(7, 88);
+// append(x, y): 添加数据点
+// x: X轴值（通常是类别或时间）
+// y: Y轴值（数值）
+lineSeries->append(0, 15);   // 点1: (0, 15)
+lineSeries->append(1, 28);   // 点2: (1, 28)
+lineSeries->append(2, 35);   // 点3: (2, 35)
+lineSeries->append(3, 42);   // 点4: (3, 42)
+lineSeries->append(4, 58);   // 点5: (4, 58)
+lineSeries->append(5, 65);   // 点6: (5, 65)
+lineSeries->append(6, 72);   // 点7: (6, 72)
+lineSeries->append(7, 88);   // 点8: (7, 88)
 lineSeries->append(8, 95);
 lineSeries->append(9, 105);
 lineSeries->append(10, 115);
@@ -3299,43 +3848,118 @@ connect(lineSeries, &QLineSeries::hovered, [=](const QPointF& point, bool state)
 
 ### 4.5 QGraphicsScene / QGraphicsView（图形视图框架）
 
+// 【使用场景】
+// - 绘图应用：画板、流程图设计器、CAD 软件
+// - 游戏：2D 游戏场景、地图编辑器
+// - 数据可视化：网络拓扑图、组织结构图
+// - 图像编辑：图片标注、图层管理
+
 ```cpp
 // ========== 图形视图框架概述 ==========
 /*
- * QGraphicsScene  - 场景，管理所有图形项
- * QGraphicsView  - 视图，显示场景内容
- * QGraphicsItem  - 图形项，场景中的元素
+ * 【三核心类】
+ * QGraphicsScene  - 场景，管理所有图形项（数据层）
+ * QGraphicsView  - 视图，显示场景内容（显示层）
+ * QGraphicsItem  - 图形项，场景中的元素（元素层）
  *
- * 坐标系统：
- * - 场景坐标：Scene coordinates，逻辑坐标
- * - 视图坐标：View coordinates，屏幕坐标
- * - 图形项坐标：Item coordinates，相对坐标
+ * 【坐标系统】
+ *
+ *  ┌───────────────────────────────────────────────────────────┐
+ *  │                    QGraphicsView (视图坐标)                │
+ *  │                    屏幕像素坐标系统                          │
+ *  │  (0,0) 在左上角，X向右增长，Y向下增长                        │
+ *  │                                                             │
+ *  │   ┌────────────────────────────────────────────┐           │
+ *   │   │         QGraphicsScene (场景坐标)          │           │
+ *   │   │         逻辑坐标系统，可任意设置             │           │
+ *   │   │   (0,0) 可在中心，默认在左上角               │           │
+ *   │   │                                            │           │
+ *   │   │   ┌──────────────────┐                    │           │
+ *   │   │   │ QGraphicsItem   │                    │           │
+ *   │   │   │ (图形项坐标)      │                    │           │
+ *   │   │   │ 相对坐标系统       │                    │           │
+ *   │   │   │ (0,0) 在项中心    │                    │           │
+ *   │   │   └──────────────────┘                    │           │
+ *   │   └────────────────────────────────────────────┘           │
+ *   └───────────────────────────────────────────────────────────┘
+ *
+ * 【坐标转换函数】
+ * - view->mapToScene(): 视图坐标 → 场景坐标
+ * - view->mapFromScene(): 场景坐标 → 视图坐标
+ * - item->mapToScene(): 图形项坐标 → 场景坐标
+ * - item->mapFromScene(): 场景坐标 → 图形项坐标
+ * - item->mapToParent(): 图形项坐标 → 父项坐标
+ * - item->mapFromParent(): 父项坐标 → 图形项坐标
  */
 
 // ========== 创建场景和视图 ==========
+// QGraphicsScene: 场景，管理所有图形项
 QGraphicsScene* scene = new QGraphicsScene(this);
-scene->setSceneRect(-200, -150, 400, 300);  // 设置场景范围
+// setSceneRect(x, y, w, h): 设置场景矩形范围
+// 参数：x=左上角X, y=左上角Y, w=宽度, h=高度
+// 设置为 (-200, -150, 400, 300) 表示 (0,0) 在场景中心
+scene->setSceneRect(-200, -150, 400, 300);
 
+// QGraphicsView: 视图，显示场景的窗口
 QGraphicsView* view = new QGraphicsView(scene, this);
+// setRenderHint: 设置渲染提示
+//   - Antialiasing: 抗锯齿（线条更平滑）
+//   - TextAntialiasing: 文字抗锯齿
+//   - SmoothPixmapTransform: 图片平滑缩放
 view->setRenderHint(QPainter::Antialiasing);  // 抗锯齿
-view->setDragMode(QGraphicsView::RubberBandDrag);  // 橡皮筋选择
+
+// setDragMode: 设置拖拽模式
+//   - NoDrag: 禁止拖拽
+//   - ScrollHandDrag: 鼠标拖动平移视图
+//   - RubberBandDrag: 橡皮筋选择框（推荐）
+view->setDragMode(QGraphicsView::RubberBandDrag);
+
+// setViewportUpdateMode: 视图更新模式
+//   - FullViewportUpdate: 完全重绘（最慢但最准确）
+//   - MinimalViewportUpdate: 最小更新区域
+//   - SmartViewportUpdate: 智能更新（推荐）
 view->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
+
+// setTransformationAnchor: 变换锚点（缩放/旋转时的中心点）
+//   - AnchorUnderMouse: 鼠标位置（推荐）
+//   - AnchorViewCenter: 视图中心
 view->setTransformationAnchor(QGraphicsView::AnchorUnderMouse);
+// setResizeAnchor: 调整大小锚点
 view->setResizeAnchor(QGraphicsView::AnchorCenter);
 
 // ========== 1. 基本图形项 ==========
 
-// 矩形
+// 【矩形】QGraphicsRectItem(x, y, w, h)
+// 参数：x=左上角X（相对坐标）, y=左上角Y, w=宽度, h=高度
 QGraphicsRectItem* rectItem = new QGraphicsRectItem(-50, -50, 100, 100);
-rectItem->setPos(0, 0);
-rectItem->setBrush(QBrush(QColor("#3498db")));
-rectItem->setPen(QPen(Qt::black, 2));
+// setPos(x, y): 设置图形项在场景中的位置
+rectItem->setPos(0, 0);  // 将矩形中心放在场景 (0,0) 处
+
+// setBrush(): 设置填充画刷
+// QBrush: 画刷类，可设置颜色、渐变、图片
+rectItem->setBrush(QBrush(QColor("#3498db")));  // 蓝色填充
+
+// setPen(): 设置边框画笔
+// QPen: 画笔类，可设置颜色、宽度、样式
+// QPen(color, width): 颜色, 像素宽度
+rectItem->setPen(QPen(Qt::black, 2));  // 黑色边框，2像素宽
+
+// setFlag(): 设置图形项标志
+// ItemIsMovable: 可移动
+// ItemIsSelectable: 可选择
+// ItemIsFocusable: 可获取键盘焦点
+// ItemIsHoverable: 可响应鼠标悬停
+// ItemSendsGeometryChanges: 发送位置变化信号
 rectItem->setFlag(QGraphicsItem::ItemIsMovable);       // 可移动
 rectItem->setFlag(QGraphicsItem::ItemIsSelectable);    // 可选择
 rectItem->setFlag(QGraphicsItem::ItemIsFocusable);     // 可聚焦
 rectItem->setFlag(QGraphicsItem::ItemIsHoverable);     // 可悬停
-rectItem->setZValue(1);  // 设置层级
-scene->addItem(rectItem);
+
+// setZValue(): 设置 Z 值（层级）
+// 数值越大，显示越靠前（在上面）
+rectItem->setZValue(1);  // 层级1
+
+scene->addItem(rectItem);  // 将图形项添加到场景
 
 // 圆角矩形
 QGraphicsRectItem* roundRect = new QGraphicsRectItem(-30, -30, 60, 60);
@@ -3349,13 +3973,17 @@ public:
         setFlag(ItemIsMovable);
     }
 
+    // boundingRect(): 必须重写，返回图形项的边界矩形
     QRectF boundingRect() const override {
-        return QRectF(-40, -40, 80, 80);
+        return QRectF(-40, -40, 80, 80);  // 中心在 (0,0)，宽80高80
     }
 
+    // paint(): 必须重写，绘制图形项
     void paint(QPainter* painter, const QStyleOptionGraphicsItem*, QWidget*) override {
         painter->setBrush(QBrush(QColor("#e74c3c")));
         painter->setPen(QPen(Qt::darkRed, 2));
+        // drawRoundedRect(): 绘制圆角矩形
+        // 参数：矩形, x半径, y半径
         painter->drawRoundedRect(boundingRect(), 10, 10);
     }
 };
@@ -3606,69 +4234,114 @@ scene->setItemIndexMethod(QGraphicsScene::BspTreeIndex);  // BSP树索引
 
 ### 5.1 基本语法与加载方式
 
-```cpp
-// ========== 方式1：代码中直接设置 ==========
-widget->setStyleSheet("background-color: #f0f0f0; color: #333;");
+// 【知识铺垫】QSS 是 Qt 的样式表语言，类似 CSS，用于定制界面外观
+// 【核心概念】样式优先级：具体控件 > 类选择器 > 全局样式
+// 【面试要点】QSS 选择器优先级、伪状态使用是常见考点
 
-// ========== 方式2：从文件加载 ==========
-QFile file(":/styles/style.qss");
+```cpp
+// ========== 方式1：代码中直接设置（适合动态样式）==========
+widget->setStyleSheet("background-color: #f0f0f0; color: #333;");
+// 【注意】频繁调用会影响性能，建议在初始化时设置
+
+// ========== 方式2：从文件加载（推荐，便于维护）==========
+QFile file(":/styles/style.qss");  // 资源文件中定义
 if (file.open(QFile::ReadOnly)) {
     QString styleSheet = QLatin1String(file.readAll());
-    qApp->setStyleSheet(styleSheet);  // 全局应用
+    qApp->setStyleSheet(styleSheet);  // 全局应用，影响所有控件
     file.close();
 }
 
 // ========== 方式3：资源文件 ==========
 // 在 .qrc 文件中定义：
 // <file>styles/style.qss</file>
+// 编译时会将 QSS 文件嵌入可执行文件
+```
+
+```cpp
+// ========== 选择器类型 ==========
+/*
+ * 选择器类型      | 语法示例              | 说明
+ * ─────────────────────────────────────────────────────────────
+ * 类型选择器      | QPushButton           | 匹配所有 QPushButton
+ * ID 选择器        | QPushButton#okBtn    | 匹配 objectName() 为 "okBtn" 的按钮
+ * 类选择器        | .QDialog              | 匹配 QDialog 及其子类（注意前面有 .）
+ * 属性选择器      | QPushButton[flat="true"] | 匹配 flat 属性为 true 的按钮
+ * 后代选择器      | QDialog QPushButton   | 匹配 QDialog 下的 QPushButton
+ * 伪状态          | QPushButton:hover      | 鼠标悬停时的样式
+ * 伪元素          | QComboBox::drop-down  | 控件的子元素（下拉按钮等）
+ *
+ * 【优先级】ID选择器 > 属性选择器 > 类选择器 > 后代选择器 > 类型选择器
+ */
 ```
 
 ### 5.2 选择器类型
 
 ```css
-/* ========== 1. 类型选择器 ========== */
+/* ========== 1. 类型选择器 ==========
+ * 【作用】匹配所有指定类型的控件
+ * 【语法】类名 { 样式规则 }
+ * 【优先级】最低，会被 ID 选择器覆盖
+ */
 QPushButton {
-    background-color: #3498db;
-    color: white;
-    border: none;
-    padding: 8px 16px;
-    border-radius: 4px;
-    font-size: 14px;
+    background-color: #3498db;      /* 蓝色背景 */
+    color: white;                 /* 白色文字 */
+    border: none;                 /* 无边框 */
+    padding: 8px 16px;             /* 内边距：上下8px，左右16px */
+    border-radius: 4px;           /* 圆角半径4像素 */
+    font-size: 14px;              /* 字号14像素 */
 }
 
-/* ========== 2. ID 选择器 ========== */
+/* ========== 2. ID 选择器 ==========
+ * 【作用】匹配指定 objectName() 的控件
+ * 【语法】类名#objectName { 样式 }
+ * 【优先级】最高
+ * 【注意】需要在代码中设置 setObjectName("okButton")
+ */
 QPushButton#okButton {
-    background-color: #27ae60;
+    background-color: #27ae60;    /* 绿色 */
 }
 
 QPushButton#cancelButton {
-    background-color: #e74c3c;
+    background-color: #e74c3c;    /* 红色 */
 }
 
-/* ========== 3. 属性选择器 ========== */
+/* ========== 3. 属性选择器 ==========
+ * 【作用】匹配指定属性值的控件
+ * 【语法】类名[属性="值"] { 样式 }
+ * 【优先级】中等
+ * 【用法】setStyleSheet("class=\"primary\"");
+ */
 QPushButton[class="primary"] {
-    background-color: #2980b9;
+    background-color: #2980b9;    /* 深蓝色 */
 }
 
 QPushButton[class="secondary"] {
-    background-color: #95a5a6;
+    background-color: #95a5a6;    /* 灰色 */
 }
 
-/* ========== 4. 后代选择器 ========== */
+/* ========== 4. 后代选择器 ==========
+ * 【作用】匹配指定容器下的控件
+ * 【语法】父控件 子控件 { 样式 }
+ * 【优先级】低
+ */
 QDialog QPushButton {
-    min-width: 80px;
-    min-height: 25px;
+    min-width: 80px;              /* 最小宽度80像素 */
+    min-height: 25px;             /* 最小高度25像素 */
 }
 
 QGroupBox QPushButton {
-    background-color: #ecf0f1;
-    color: #2c3e50;
+    background-color: #ecf0f1;    /* 浅灰背景 */
+    color: #2c3e50;               /* 深灰文字 */
 }
 
-/* ========== 5. 子控件选择器 ========== */
+/* ========== 5. 子控件选择器 ==========
+ * 【作用】匹配控件的子元素（下拉按钮、滚动条等）
+ * 【语法】控件::子控件 { 样式 }
+ * 【常见子控件】drop-down, down-arrow, up-arrow, add-line, sub-line, handle, groove
+ */
 QComboBox::drop-down {
-    border: none;
-    width: 20px;
+    border: none;                 /* 移除边框 */
+    width: 20px;                  /* 下拉按钮宽度 */
 }
 
 QComboBox::down-arrow {
@@ -4362,26 +5035,50 @@ QStatusBar QLabel {
 
 ## 六、多线程
 
+// 【线程安全注意事项】
+// 1. UI 操作只能在主线程（GUI 线程）进行
+// 2. 跨线程访问共享数据必须加锁（QMutex、QReadWriteLock）
+// 3. 跨线程信号槽默认使用 QueuedConnection（异步）
+// 4. 不要在子线程中创建 QWidget 及其子类
+// 5. 线程结束后务必调用 quit() 和 wait()
+
 ### 6.1 QThread 基本用法
 
 ```cpp
 // ========== 方式1：继承 QThread（不推荐）==========
+// 【缺点】
+// - run() 执行完后线程对象才真正工作
+// - 灵活性差，不适合复杂场景
+// 【适用场景】简单的独立任务
+
 class WorkerThread : public QThread {
     Q_OBJECT
 public:
     explicit WorkerThread(QObject* parent = nullptr) : QThread(parent) {}
 
+    // 【线程停止方法】
     void stop() {
-        requestInterruption();  // 请求中断
+        // requestInterruption(): 设置中断标志位
+        // 不会强制终止线程，而是让 isInterruptionRequested() 返回 true
+        requestInterruption();
+        // wait(): 阻塞等待线程结束
+        // 参数：超时时间（毫秒），默认 ULONG_MAX（无限等待）
         wait();  // 等待线程结束
     }
 
 protected:
+    // 【run() 函数】线程入口函数
+    // 在新线程中执行，返回后线程结束
     void run() override {
         // 这里是子线程的代码
+        // isInterruptionRequested(): 检查是否请求中断
+        // 【最佳实践】在循环中定期检查此标志
         for (int i = 0; i < 100 && !isInterruptionRequested(); ++i) {
+            // emit: 发送信号
+            // 跨线程发送信号时，会自动使用 QueuedConnection
             emit progressChanged(i);
 
+            // msleep(): 毫秒级睡眠（静态函数）
             // 模拟耗时操作
             msleep(100);
         }
@@ -4393,10 +5090,13 @@ signals:
     void workFinished();
 };
 
-// 使用
+// 【使用示例】
 WorkerThread* thread = new WorkerThread();
+// 连接信号槽
+// 默认使用 AutoConnection，跨线程时变为 QueuedConnection
+// progressChanged 在子线程发射，在主线程处理
 connect(thread, &WorkerThread::progressChanged, [](int value) {
-    qDebug() << "Progress:" << value;
+    qDebug() << "Progress:" << value;  // 在主线程执行
 });
 connect(thread, &WorkerThread::workFinished, []() {
     qDebug() << "Work finished!";
@@ -4678,24 +5378,97 @@ void exampleQtConcurrent() {
 
 ## 七、文件与配置
 
+// 【路径处理注意事项】
+// 1. 使用 QDir/QFileInfo 处理路径，自动适配平台
+// 2. 路径分隔符：Windows 用 "\"，Unix 用 "/"
+//    - Qt::DirSeparator 或 "/" 可自动适配
+// 3. 相对路径 vs 绝对路径：
+//    - 相对路径：相对于程序工作目录
+//    - 绝对路径：完整路径，更可靠
+// 4. 路径拼接使用 "/" 或 QDir::separator()
+// 5. 编码问题：Windows 文件名可能包含非 ASCII 字符
+
 ### 7.1 QFile 文件读写
 
 ```cpp
+// ========== 路径处理（跨平台）==========
+
+// 【获取标准路径】
+void getStandardPaths() {
+    // 应用程序目录
+    QString appPath = QCoreApplication::applicationDirPath();
+    // Windows: "C:/MyApp"
+    // Linux: "/usr/bin"
+
+    // 当前工作目录
+    QString currentPath = QDir::currentPath();
+
+    // 用户主目录
+    QString homePath = QDir::homePath();
+    // Windows: "C:/Users/Username"
+    // Linux: "/home/username"
+
+    // 临时目录
+    QString tempPath = QDir::tempPath();
+
+    // 【应用程序数据目录】
+    // QStandardPaths::AppDataLocation: 跨平台应用数据目录
+    QString dataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    // Windows: "C:/Users/Username/AppData/Roaming/MyApp"
+    // macOS: "~/Library/Application Support/MyApp"
+    // Linux: "~/.config/MyApp"
+}
+
+// 【路径拼接】
+void pathJoining() {
+    // 方式1：使用 "/" 自动适配
+    QString fullPath1 = QDir::homePath() + "/Documents/file.txt";
+
+    // 方式2：使用 QDir::filePath()
+    QDir dir(QDir::homePath());
+    QString fullPath2 = dir.filePath("Documents/file.txt");
+
+    // 方式3：使用 QFileInfo（推荐）
+    QFileInfo fileInfo(QDir::homePath(), "Documents/file.txt");
+    QString fullPath3 = fileInfo.absoluteFilePath();
+}
+
 // ========== 文本文件读写 ==========
 
 // 写入文本文件
 void writeTextFile() {
+    // 【QFile 构造】可以传入绝对路径或相对路径
+    // 相对路径相对于程序工作目录
     QFile file("output.txt");
-    if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        QTextStream out(&file);
-        out.setEncoding(QStringConverter::Utf8);  // Qt6
-        // out.setCodec("UTF-8");  // Qt5
+    // 或者使用绝对路径
+    // QFile file(QDir::homePath() + "/output.txt");
 
-        out << "Hello, Qt!" << Qt::endl;
+    // 【open() 打开文件】
+    // QIODevice::OpenModeFlag 枚举：
+    //   - ReadOnly: 只读
+    //   - WriteOnly: 只写
+    //   - ReadWrite: 读写
+    //   - Append: 追加
+    //   - Truncate: 清空文件
+    //   - Text: 文本模式（转换换行符）
+    if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        // QTextStream: 文本流，支持格式化输出
+        QTextStream out(&file);
+
+        // 【编码设置】
+        // Qt6: setEncoding(QStringConverter::Utf8)
+        // Qt5: setCodec("UTF-8")
+        // 常用编码：UTF-8, GBK, System
+        out.setEncoding(QStringConverter::Utf8);
+
+        // 【写入数据】
+        out << "Hello, Qt!" << Qt::endl;  // Qt::endl: 跨平台换行
         out << "中文内容" << Qt::endl;
         out << 12345 << Qt::endl;
 
-        file.close();
+        file.close();  // 【关闭文件】析构时自动关闭，显式关闭更安全
+    } else {
+        qDebug() << "Failed to open file:" << file.errorString();
     }
 }
 
@@ -4706,10 +5479,17 @@ void readTextFile() {
         QTextStream in(&file);
         in.setEncoding(QStringConverter::Utf8);
 
+        // 【按行读取】
+        // atEnd(): 是否到达文件末尾
         while (!in.atEnd()) {
-            QString line = in.readLine();
+            QString line = in.readLine();  // readLine(): 读取一行
             qDebug() << line;
         }
+
+        // 【一次性读取全部】
+        // file.readAll(): 返回 QByteArray
+        // QString::fromUtf8(): 转换为 QString
+        // QString allContent = QString::fromUtf8(file.readAll());
 
         file.close();
     }
@@ -4719,14 +5499,18 @@ void readTextFile() {
 
 void writeBinaryFile() {
     QFile file("data.bin");
+    // 二进制文件不需要 Text 标志
     if (file.open(QIODevice::WriteOnly)) {
+        // QDataStream: 二进制数据流
+        // 自动处理字节序（大端/小端）
         QDataStream out(&file);
 
-        // 写入数据
-        out << QString("Hello");
-        out << 42;
-        out << 3.14;
-        out << QByteArray("Binary data");
+        // 【写入数据】
+        // QDataStream 支持大多数 Qt 类型
+        out << QString("Hello");           // 字符串
+        out << (qint32)42;                 // 整数（指定大小）
+        out << 3.14;                       // 浮点数
+        out << QByteArray("Binary data");  // 字节数组
 
         file.close();
     }
@@ -5791,16 +6575,131 @@ signals:
 
 ### 10.2 qmake
 
+// 【.pro 文件变量速查表】
+/*
+ * ┌─────────────────┬────────────────────────────────────────┐
+ * │ 变量名          │ 用途说明                               │
+ * ├─────────────────┼────────────────────────────────────────┤
+ * │ TEMPLATE        │ 项目模板 (app/lib/subdirs/aux)         │
+ * │ TARGET          │ 目标文件名（不含扩展名）               │
+ * │ QT              │ Qt 模块 (core/gui/widgets/...)        │
+ * │ SOURCES         │ 源文件列表 (*.cpp)                     │
+ * │ HEADERS         │ 头文件列表 (*.h)                       │
+ * │ FORMS           │ UI 文件列表 (*.ui)                     │
+ * │ RESOURCES       │ 资源文件列表 (*.qrc)                   │
+ * │ CONFIG          │ 编译配置选项                           │
+ * │ DEFINES         │ 预处理器宏定义                         │
+ * │ INCLUDEPATH     │ 头文件搜索路径                         │
+ * │ LIBS            │ 链接库 (-lxxx 或 /path/to/lib)         │
+ * │ LFLAGS          │ 链接器标志                             │
+ * │ CXXFLAGS        │ C++ 编译器标志                         │
+ * │ MOC_DIR         │ MOC 生成文件目录                       │
+ * │ OBJECTS_DIR     │ 目标文件目录 (.obj)                    │
+ * │ UI_DIR          │ UI 生成文件目录                        │
+ * │ RCC_DIR         │ RCC 生成文件目录                       │
+ * └─────────────────┴────────────────────────────────────────┘
+ *
+ * 【CONFIG 常用选项】
+ * ┌─────────────────┬────────────────────────────────────────┐
+ * │ c++11/14/17/20  │ C++ 语言标准                           │
+ * │ debug/release   │ 构建类型                               │
+ * │ debug_and_release │ 同时构建两种版本                    │
+ * │ console         │ 控制台程序（Windows 显示控制台）       │
+ * │ warn_on/off     │ 编译警告开关                           │
+ * │ exceptions      │ 启用异常（默认）                       │
+ * │ rtti            │ 启用 RTTI（默认）                      │
+ * │ stl             │ 启用 STL（默认）                       │
+ * │ static/shared   │ 静态库/动态库（lib 模板）              │
+ * │ plugin          │ 生成插件（lib 模板）                   │
+ * └─────────────────┴────────────────────────────────────────┘
+ */
+
 ```qmake
 # ========== .pro 文件基本结构 ==========
 
-# 项目模板
+# 【项目模板】TEMPLATE
+# 指定项目类型，决定 qmake 生成的 Makefile 类型
 TEMPLATE = app
-# TEMPLATE 值:
-#   app  - 应用程序
-#   lib  - 库
-#   subdirs - 子目录项目
-#   aux  - 辅助项目（不编译）
+# 可选值:
+#   app        - 应用程序（默认）生成可执行文件
+#   lib        - 库项目，生成 .dll/.so/.dylib
+#   subdirs    - 子目录项目，用于构建多目录工程
+#   aux        - 辅助项目，不编译，仅用于安装等操作
+
+# 【目标名称】TARGET
+# 指定生成的目标文件名（不含扩展名）
+TARGET = MyApplication
+# Windows:   MyApplication.exe
+# Linux:     MyApplication
+# macOS:     MyApplication.app
+
+# 【Qt 模块】QT +=/ -=
+# 添加需要的 Qt 模块，自动处理依赖关系
+QT += core gui widgets
+# 常用模块:
+#   core          - 核心功能（默认包含，无需显式添加）
+#   gui           - GUI 功能（依赖 core）：QPainter, QImage, QColor
+#   widgets       - 控件（依赖 gui）：QWidget, QPushButton, QLabel
+#   network       - 网络功能：QTcpSocket, QNetworkAccessManager
+#   sql           - 数据库：QSqlDatabase, QSqlQuery
+#   xml           - XML 处理：QDomDocument, QXmlStreamReader
+#   charts        - 图表（需要单独安装）：QChart, QLineSeries
+#   printsupport  - 打印支持：QPrinter, QPrintDialog
+#   testlib       - 测试框架：QTest
+#   concurrent    - 并发：QtConcurrent, QFuture
+#   multimedia    - 多媒体：QMediaPlayer, QCamera
+
+# 排除模块（慎用）
+QT -= gui  # 移除 gui 模块，用于纯控制台程序
+
+# ========== 源文件 ==========
+# 【SOURCES】指定 C++ 源文件
+SOURCES += main.cpp \
+           widget.cpp \
+           model.cpp
+
+# ========== 头文件 ==========
+# 【HEADERS】指定 C++ 头文件
+HEADERS += widget.h \
+           model.h
+
+# ========== UI 文件 ==========
+# 【FORMS】指定 Qt Designer UI 文件
+FORMS += widget.ui \
+         dialog.ui
+
+# ========== 资源文件 ==========
+# 【RESOURCES】指定 Qt 资源文件
+RESOURCES += resources.qrc
+
+# ========== 编译配置 ==========
+# 【CONFIG】编译选项配置
+CONFIG += c++17              # C++ 标准（c++11/c++14/c++17/c++20）
+CONFIG += debug_and_release  # 同时生成 debug 和 release
+CONFIG += console            # 控制台程序（Windows 显示控制台窗口）
+CONFIG += warn_on            # 显示编译警告（默认）
+CONFIG += exceptions         # 启用 C++ 异常（默认）
+CONFIG += rtti               # 启用运行时类型信息（默认）
+CONFIG += stl                # 启用 STL（默认）
+
+# 【DEFINES】预处理器宏定义
+DEFINES += QT_DEPRECATED_WARNINGS
+DEFINES += MY_APP_VERSION=\\\"1.0.0\\\"  # 字符串宏需转义引号
+
+# 【INCLUDEPATH】头文件搜索路径（-I 选项）
+INCLUDEPATH += /usr/local/include \
+               ./include
+
+# 【LIBS】链接库（-L -l 选项或直接指定路径）
+LIBS += -L/usr/local/lib -lmylib  # -L:库路径 -l:库名
+LIBS += -lxml2 -lz
+# Windows 直接指定 .lib 文件
+LIBS += C:/mylib/mylib.lib
+
+# 【条件编译】平台判断
+win32 {                # Windows 平台
+    SOURCES += windows_specific.cpp
+    LIBS += -luser32 -lgdi32
 
 # 目标名称
 TARGET = MyApplication
@@ -6408,7 +7307,7 @@ void registerFileAssociation() {
 
     // 设置文件类型
     settings.setValue(fileType + "/DefaultIcon/.", appPath + ",0");
-    settings.setValue(fileType + "/shell/ope  n/command/.", "\"" + appPath + "\" \"%1\"");
+    settings.setValue(fileType + "/shell/open/command/.", "\"" + appPath + "\" \"%1\"");
 
     // 关联扩展名
     settings.setValue("." + ext + "/Default", fileType);
@@ -8057,7 +8956,6 @@ void dateTimeFunctions() {
 ```cpp
 #include <QDir>
 #include <QFileInfo>
-#include <QPath>
 
 void pathFunctions() {
     // ========== 路径拼接 ==========
